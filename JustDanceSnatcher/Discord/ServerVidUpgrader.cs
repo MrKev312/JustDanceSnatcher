@@ -1,32 +1,32 @@
-using DSharpPlus;
+﻿using DSharpPlus;
 using DSharpPlus.Entities;
 using DSharpPlus.EventArgs;
 
+using JustDanceSnatcher.Core;
+using JustDanceSnatcher.Discord.Helpers;
+using JustDanceSnatcher.Discord.Models;
 using JustDanceSnatcher.Helpers;
 using JustDanceSnatcher.UbisoftStuff;
 
-using System.IO;
 using System.Text.Json;
 
-namespace JustDanceSnatcher;
+namespace JustDanceSnatcher.Discord;
 
 internal enum ServerUpgradeStep
 {
-	RequestPreview, // For /assets server:jdu
-	RequestMain // For /nohud
+	RequestPreview,
+	RequestMain
 }
 
-// Note: This class is no longer static. Instantiate it to use.
 internal class ServerVidUpgrader : DiscordAssetDownloaderBase<JDNextDatabaseEntry, JDNextDiscordEmbed>
 {
 	private ServerUpgradeStep _currentStep = ServerUpgradeStep.RequestPreview;
-	private JDNextDiscordEmbed _accumulatedSongData = new(); // To store data across steps
+	private JDNextDiscordEmbed _accumulatedSongData = new();
 
-	// Mappings for EmbedParserHelper
 	private static readonly IReadOnlyDictionary<string, string> PreviewUrlFieldMap = new Dictionary<string, string>
 	{
-		{"Audio:", nameof(PreviewURLs.audioPreview)}, // Note: JDU /assets uses "Audio:" for audioPreview
-        {"HIGH (vp9)", nameof(PreviewURLs.HIGHvp9)},
+		{"Audio:", nameof(PreviewURLs.audioPreview)},
+		{"HIGH (vp9)", nameof(PreviewURLs.HIGHvp9)},
 		{"LOW (vp9)", nameof(PreviewURLs.LOWvp9)},
 		{"MID (vp9)", nameof(PreviewURLs.MIDvp9)},
 		{"ULTRA (vp9)", nameof(PreviewURLs.ULTRAvp9)}
@@ -41,8 +41,7 @@ internal class ServerVidUpgrader : DiscordAssetDownloaderBase<JDNextDatabaseEntr
 	};
 
 	protected override string BotToken => File.ReadAllText("Secret.txt").Trim();
-	// ExpectedEmbedCount varies by step, so override IsErrorEmbed or ParseEmbedsToData to handle
-	protected override int ExpectedEmbedCount => 0; // Set to 0 to allow custom handling in ParseEmbedsToData
+	protected override int ExpectedEmbedCount => 0; // Custom handling
 
 	protected override async Task InitializeAsync()
 	{
@@ -59,9 +58,8 @@ internal class ServerVidUpgrader : DiscordAssetDownloaderBase<JDNextDatabaseEntr
 			try
 			{
 				string json = File.ReadAllText(songInfoPath);
-				JDNextDatabaseEntry entry = JsonSerializer.Deserialize<JDNextDatabaseEntry>(json, Program.jsonOptions)!;
+				JDNextDatabaseEntry entry = JsonSerializer.Deserialize<JDNextDatabaseEntry>(json, GlobalConfig.JsonOptions)!;
 
-				// Rename folder if it doesn't match parentMapName (as in original logic)
 				string expectedFolderName = entry.parentMapName;
 				string currentFolderName = Path.GetFileName(folder);
 				string correctedFolderPath = folder;
@@ -69,7 +67,7 @@ internal class ServerVidUpgrader : DiscordAssetDownloaderBase<JDNextDatabaseEntr
 				if (!string.Equals(currentFolderName, expectedFolderName, StringComparison.OrdinalIgnoreCase))
 				{
 					string targetPath = Path.Combine(Path.GetDirectoryName(folder)!, expectedFolderName);
-					if (!Directory.Exists(targetPath)) // Avoid conflict if target already exists somehow
+					if (!Directory.Exists(targetPath))
 					{
 						Directory.Move(folder, targetPath);
 						correctedFolderPath = targetPath;
@@ -90,9 +88,6 @@ internal class ServerVidUpgrader : DiscordAssetDownloaderBase<JDNextDatabaseEntr
 				if (Directory.Exists(videoPreviewPath) && Directory.GetFiles(videoPreviewPath).Length <= 1)
 					needsUpgrade = true;
 
-				// Original logic also checked for UNKNOWN.webm, but stated deprecated
-				// if (File.Exists(Path.Combine(videoPath, "UNKNOWN.webm"))) needsUpgrade = true;
-
 				if (needsUpgrade)
 				{
 					Console.WriteLine($"Adding '{entry.parentMapName}' to the upgrade queue.");
@@ -105,7 +100,7 @@ internal class ServerVidUpgrader : DiscordAssetDownloaderBase<JDNextDatabaseEntr
 			}
 		}
 
-		await Task.CompletedTask; // No async operations in this Initialize
+		await Task.CompletedTask;
 	}
 
 	protected override string GetDiscordCommandForItem(JDNextDatabaseEntry item)
@@ -115,15 +110,11 @@ internal class ServerVidUpgrader : DiscordAssetDownloaderBase<JDNextDatabaseEntr
 			: $"/nohud codename:{item.parentMapName}";
 	}
 
-	// This downloader has a two-step process per item.
-	// We override the message handling part of the base to manage state.
-	// The base OnDiscordMessageCreatedAsync is not used directly. We call its helpers.
-	// This means the base method's HandleUserCommandAsync will also need to be explicitly called.
-	protected async Task OnDiscordMessageCreatedAsync(DiscordClient sender, MessageCreateEventArgs e)
+	protected override async Task OnDiscordMessageCreatedAsync(DiscordClient sender, MessageCreateEventArgs e)
 	{
 		if (e.Author.IsCurrent || !e.Author.IsBot)
 		{
-			await HandleUserCommandAsync(e); // Use base class's user command handler
+			await base.HandleUserCommandAsync(e); // Use base for standard user commands
 			return;
 		}
 
@@ -136,7 +127,6 @@ internal class ServerVidUpgrader : DiscordAssetDownloaderBase<JDNextDatabaseEntr
 		if (e.Message.Embeds.Count == 0 || IsErrorEmbed(e.Message))
 		{
 			Console.WriteLine(e.Message.Embeds.Count == 0 ? "No embeds in response." : "Error embed received.");
-			// Use base class's command failure logic. It will retry command or skip item.
 			await base.HandleCommandFailureAsync(e.Message.Embeds.Count == 0 ? "No embeds" : "Error embed");
 			return;
 		}
@@ -152,55 +142,52 @@ internal class ServerVidUpgrader : DiscordAssetDownloaderBase<JDNextDatabaseEntr
 		if (_currentStep == ServerUpgradeStep.RequestPreview)
 		{
 			if (e.Message.Embeds.Count < 3)
-			{ // Expect 3 embeds from /assets jdu
+			{
 				Console.WriteLine($"Expected 3 embeds for preview, got {e.Message.Embeds.Count}.");
 				await base.HandleCommandFailureAsync("Incorrect embed count for preview");
 				return;
 			}
-			// Parse preview URLs from Embeds[1] (0: images, 1: previews, 2: content links)
-			EmbedParserHelper.ParseFields(_accumulatedSongData.PreviewURLs, e.Message.Embeds[1].Fields, PreviewUrlFieldMap);
 
+			EmbedParserHelper.ParseFields(_accumulatedSongData.PreviewURLs, e.Message.Embeds[1].Fields, PreviewUrlFieldMap);
 			_currentStep = ServerUpgradeStep.RequestMain;
-			await SendNextDiscordCommandAsync(); // Sends /nohud command for the same item
+			await SendNextDiscordCommandAsync();
 		}
 		else // ServerUpgradeStep.RequestMain
 		{
 			if (e.Message.Embeds.Count < 1)
-			{ // Expect 1 embed from /nohud
+			{
 				Console.WriteLine($"Expected 1 embed for main, got {e.Message.Embeds.Count}.");
 				await base.HandleCommandFailureAsync("Incorrect embed count for main");
 				return;
 			}
-			// Parse main content URLs (HD versions)
+
 			EmbedParserHelper.ParseFields(_accumulatedSongData.ContentURLs, e.Message.Embeds[0].Fields, MainContentUrlFieldMap);
 
 			Console.WriteLine($"Successfully parsed all data for item: {currentItem.parentMapName}. Processing...");
 			bool success = await ProcessDataItemAsync(_accumulatedSongData, currentItem);
 
-			_currentStep = ServerUpgradeStep.RequestPreview; // Reset state for the next item
-			_accumulatedSongData = new JDNextDiscordEmbed(); // Clear accumulated data
+			_currentStep = ServerUpgradeStep.RequestPreview;
+			_accumulatedSongData = new JDNextDiscordEmbed();
 
 			if (success)
 			{
 				Console.WriteLine($"Successfully processed item: {currentItem.parentMapName}.");
 				FailCounterForCurrentItem = 0;
 				ItemQueue.Dequeue();
-				await SendNextDiscordCommandAsync(); // Move to next item
+				await SendNextDiscordCommandAsync();
 			}
 			else
 			{
-				// Use base class's item processing failure logic
 				await base.HandleItemProcessingFailureAsync(currentItem, "ProcessDataItemAsync returned false.");
 			}
 		}
 	}
 
-	// We've overridden OnDiscordMessageCreatedAsync, so ParseEmbedsToData is not directly called by base.
-	// Logic is in the overridden OnDiscordMessageCreatedAsync.
 	protected override JDNextDiscordEmbed? ParseEmbedsToData(DiscordMessage message)
 	{
-		// This won't be called by the base flow due to the override.
-		// If it were, it would need to be state-aware (_currentStep).
+		// This method is not strictly needed for this class if OnDiscordMessageCreatedAsync handles parsing directly.
+		// However, if base class structure relies on it, it would need to be aware of _currentStep.
+		// For this specific override structure of OnDiscordMessageCreatedAsync, this won't be called by the main flow.
 		return null;
 	}
 
@@ -209,11 +196,10 @@ internal class ServerVidUpgrader : DiscordAssetDownloaderBase<JDNextDatabaseEntr
 		string mapName = songInfo.parentMapName;
 		Console.WriteLine($"Upgrading videos for '{mapName}'...");
 
-		// Validate essential URLs from accumulated data
-		if (songURLs.PreviewURLs.audioPreview == null || // from /assets jdu
+		if (songURLs.PreviewURLs.audioPreview == null ||
 			songURLs.PreviewURLs.ULTRAvp9 == null || songURLs.PreviewURLs.HIGHvp9 == null ||
 			songURLs.PreviewURLs.MIDvp9 == null || songURLs.PreviewURLs.LOWvp9 == null ||
-			songURLs.ContentURLs.UltraHD == null || songURLs.ContentURLs.HighHD == null || // from /nohud
+			songURLs.ContentURLs.UltraHD == null || songURLs.ContentURLs.HighHD == null ||
 			songURLs.ContentURLs.MidHD == null || songURLs.ContentURLs.LowHD == null)
 		{
 			Console.WriteLine($"Essential URLs missing for '{mapName}' after two-step fetch. Cannot upgrade.");
@@ -229,10 +215,9 @@ internal class ServerVidUpgrader : DiscordAssetDownloaderBase<JDNextDatabaseEntr
 		Directory.CreateDirectory(videoPreviewPath);
 		Directory.CreateDirectory(audioPreviewOpusPath);
 
-		// Clean up old "UNKNOWN.webm" files if they exist (as per original logic)
 		string unknownVideo = Path.Combine(videoPath, "UNKNOWN.webm");
 		string unknownPreview = Path.Combine(videoPreviewPath, "UNKNOWN.webm");
-		string lowPreviewLegacy = Path.Combine(videoPreviewPath, "LOW.webm"); // Also in original logic
+		string lowPreviewLegacy = Path.Combine(videoPreviewPath, "LOW.webm");
 		if (File.Exists(unknownVideo))
 			File.Delete(unknownVideo);
 		if (File.Exists(unknownPreview))
@@ -242,21 +227,16 @@ internal class ServerVidUpgrader : DiscordAssetDownloaderBase<JDNextDatabaseEntr
 
 		List<Task> downloadTasks =
 		[
-			// Preview videos (vp9 versions)
 			Download.DownloadFileMD5Async(songURLs.PreviewURLs.LOWvp9, videoPreviewPath),
 			Download.DownloadFileMD5Async(songURLs.PreviewURLs.MIDvp9, videoPreviewPath),
 			Download.DownloadFileMD5Async(songURLs.PreviewURLs.HIGHvp9, videoPreviewPath),
 			Download.DownloadFileMD5Async(songURLs.PreviewURLs.ULTRAvp9, videoPreviewPath),
-
-			// Main videos (HD versions)
 			Download.DownloadFileMD5Async(songURLs.ContentURLs.UltraHD, videoPath),
 			Download.DownloadFileMD5Async(songURLs.ContentURLs.HighHD, videoPath),
 			Download.DownloadFileMD5Async(songURLs.ContentURLs.MidHD, videoPath),
 			Download.DownloadFileMD5Async(songURLs.ContentURLs.LowHD, videoPath),
 		];
 
-		// Audio preview (opus)
-		// Check if AudioPreview_opus folder is empty or doesn't exist (original logic)
 		if (!Directory.Exists(audioPreviewOpusPath) || Directory.GetFiles(audioPreviewOpusPath).Length == 0)
 		{
 			downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.PreviewURLs.audioPreview, audioPreviewOpusPath));

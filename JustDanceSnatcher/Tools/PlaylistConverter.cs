@@ -1,18 +1,19 @@
-﻿using JustDanceSnatcher.Helpers;
+﻿using JustDanceSnatcher.Core;
+using JustDanceSnatcher.Helpers;
 
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 
-namespace JustDanceSnatcher;
+namespace JustDanceSnatcher.Tools;
 
 internal static class PlaylistConverter
 {
-	// This 'writer' uses CamelCase, different from Program.jsonOptions. So it's kept separate.
 	private static readonly JsonSerializerOptions writerOptions = new()
 	{
 		WriteIndented = true,
-		Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+		Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
 		PropertyNamingPolicy = JsonNamingPolicy.CamelCase
 	};
 
@@ -22,11 +23,11 @@ internal static class PlaylistConverter
 		string mapsFolder = Question.AskFolder("Select the maps folder (containing SongInfo.json files): ", true);
 
 		string json = File.ReadAllText(jsonPath);
-		PlaylistJson? playlistJsonSource = JsonSerializer.Deserialize<PlaylistJson>(json, Program.jsonOptions);
+		PlaylistJson? playlistJsonSource = JsonSerializer.Deserialize<PlaylistJson>(json, GlobalConfig.JsonOptions);
 
 		if (playlistJsonSource == null)
 		{
-			Console.WriteLine("Failed to deserialize the source playlist JSON.");
+			Console.WriteLine("Failed to deserialize source playlist JSON.");
 			return;
 		}
 
@@ -36,12 +37,11 @@ internal static class PlaylistConverter
 		LocalizedStrings? localizedStrings = null;
 		if (File.Exists(localizedStringsPath))
 		{
-			string localizedStringsContent = File.ReadAllText(localizedStringsPath);
-			localizedStrings = JsonSerializer.Deserialize<LocalizedStrings>(localizedStringsContent, Program.jsonOptions);
+			localizedStrings = JsonSerializer.Deserialize<LocalizedStrings>(File.ReadAllText(localizedStringsPath), GlobalConfig.JsonOptions);
 		}
 		else
 		{
-			Console.WriteLine($"Warning: Localized strings file not found at '{localizedStringsPath}'. Titles and descriptions might be Oasis IDs.");
+			Console.WriteLine($"Warning: Localized strings file not found at '{localizedStringsPath}'.");
 		}
 
 		string outputPlaylistFolder = Path.Combine(mapsFolder, "..", "..", "database", "playlists");
@@ -49,62 +49,42 @@ internal static class PlaylistConverter
 
 		foreach (KeyValuePair<Guid, Playlist> playlistEntry in playlistJsonSource.playlists)
 		{
-			Guid playlistGuid = playlistEntry.Key;
-			Playlist sourcePlaylist = playlistEntry.Value;
-
-			if (playlistJsonSource.dynamicPlaylists.Contains(playlistGuid))
+			if (playlistJsonSource.dynamicPlaylists.Contains(playlistEntry.Key))
 			{
-				Console.WriteLine($"Playlist '{sourcePlaylist.playlistName}' ({playlistGuid}) is dynamic. Skipping.");
+				Console.WriteLine($"Playlist '{playlistEntry.Value.playlistName}' is dynamic. Skipping.");
 				continue;
 			}
 
-			Console.WriteLine($"Processing playlist: {sourcePlaylist.playlistName}");
+			Console.WriteLine($"Processing playlist: {playlistEntry.Value.playlistName}");
 
 			JsonPlaylist newPlaylist = new()
 			{
-				Guid = playlistGuid,
-				PlaylistName = sourcePlaylist.playlistName,
-				CoverUrl = sourcePlaylist.assets?.en?.cover ?? string.Empty,
-				CoverDetailsUrl = sourcePlaylist.assets?.en?.coverDetails ?? string.Empty,
-				Tags = sourcePlaylist.tags?.Length > 0 ? sourcePlaylist.tags : null
+				Guid = playlistEntry.Key,
+				PlaylistName = playlistEntry.Value.playlistName,
+				CoverUrl = playlistEntry.Value.assets?.en?.cover ?? string.Empty,
+				CoverDetailsUrl = playlistEntry.Value.assets?.en?.coverDetails ?? string.Empty,
+				Tags = playlistEntry.Value.tags?.Length > 0 ? playlistEntry.Value.tags : null,
+				LocalizedTitle = localizedStrings?.localizedStrings
+					.FirstOrDefault(x => x.oasisId == playlistEntry.Value.localizedTitle.ToString())?.displayString ?? playlistEntry.Value.localizedTitle.ToString(),
+				LocalizedDescription = localizedStrings?.localizedStrings
+					.FirstOrDefault(x => x.oasisId == playlistEntry.Value.localizedDescription.ToString())?.displayString ?? playlistEntry.Value.localizedDescription.ToString()
 			};
 
-			if (localizedStrings != null)
-			{
-				newPlaylist.LocalizedTitle = localizedStrings.localizedStrings
-					.FirstOrDefault(x => x.oasisId == sourcePlaylist.localizedTitle.ToString())?.displayString ?? sourcePlaylist.localizedTitle.ToString();
-				newPlaylist.LocalizedDescription = localizedStrings.localizedStrings
-					.FirstOrDefault(x => x.oasisId == sourcePlaylist.localizedDescription.ToString())?.displayString ?? sourcePlaylist.localizedDescription.ToString();
-			}
-			else
-			{
-				newPlaylist.LocalizedTitle = sourcePlaylist.localizedTitle.ToString(); // Fallback to ID
-				newPlaylist.LocalizedDescription = sourcePlaylist.localizedDescription.ToString(); // Fallback to ID
-			}
-
-
-			foreach (Itemlist item in sourcePlaylist.itemList)
+			foreach (Itemlist item in playlistEntry.Value.itemList)
 			{
 				if (item.type == "map" && Guid.TryParse(item.id, out Guid mapGuid))
 				{
 					if (songIdToMapNameMap.TryGetValue(mapGuid, out string? mapName))
-					{
 						newPlaylist.ItemList.Add(mapName);
-					}
 					else
-					{
-						Console.WriteLine($"Warning: Map with ID '{mapGuid}' not found in local maps folder for playlist '{sourcePlaylist.playlistName}'.");
-					}
+						Console.WriteLine($"Warning: Map ID '{mapGuid}' not found for playlist '{newPlaylist.PlaylistName}'.");
 				}
 				else
-				{
-					Console.WriteLine($"Skipping non-map item or item with invalid ID: Type='{item.type}', ID='{item.id}' in playlist '{sourcePlaylist.playlistName}'.");
-				}
+					Console.WriteLine($"Skipping non-map item: Type='{item.type}', ID='{item.id}' in playlist '{newPlaylist.PlaylistName}'.");
 			}
 
 			string outputJsonPath = Path.Combine(outputPlaylistFolder, $"{SanitizeFileName(newPlaylist.PlaylistName)}.json");
-			string finalJson = JsonSerializer.Serialize(newPlaylist, writerOptions);
-			File.WriteAllText(outputJsonPath, finalJson);
+			File.WriteAllText(outputJsonPath, JsonSerializer.Serialize(newPlaylist, writerOptions));
 			Console.WriteLine($"Converted playlist '{newPlaylist.PlaylistName}' saved to '{outputJsonPath}'.");
 		}
 	}
@@ -112,29 +92,19 @@ internal static class PlaylistConverter
 	private static Dictionary<Guid, string> LoadSongIdToMapNameMapping(string mapsFolder)
 	{
 		Dictionary<Guid, string> map = [];
-		string[] individualMapFolders = Directory.GetDirectories(mapsFolder);
-
-		foreach (string mapFolder in individualMapFolders)
+		foreach (string mapFolder in Directory.GetDirectories(mapsFolder))
 		{
 			string songInfoPath = Path.Combine(mapFolder, "SongInfo.json");
 			if (!File.Exists(songInfoPath))
-			{
-				Console.WriteLine($"Warning: SongInfo.json not found in '{mapFolder}'. Skipping for playlist conversion mapping.");
 				continue;
-			}
-
 			try
 			{
-				string songInfoContent = File.ReadAllText(songInfoPath);
-				JsonObject? info = JsonSerializer.Deserialize<JsonObject>(songInfoContent);
-
+				JsonObject? info = JsonSerializer.Deserialize<JsonObject>(File.ReadAllText(songInfoPath));
 				if (info != null && info.TryGetPropertyValue("songID", out JsonNode? songIdNode) &&
-					info.TryGetPropertyValue("mapName", out JsonNode? mapNameNode))
+					info.TryGetPropertyValue("mapName", out JsonNode? mapNameNode) &&
+					Guid.TryParse(songIdNode!.GetValue<string>(), out Guid songGuid))
 				{
-					if (Guid.TryParse(songIdNode!.GetValue<string>(), out Guid songGuid))
-					{
-						map[songGuid] = mapNameNode!.GetValue<string>();
-					}
+					map[songGuid] = mapNameNode!.GetValue<string>();
 				}
 			}
 			catch (Exception ex)
@@ -145,10 +115,7 @@ internal static class PlaylistConverter
 
 		return map;
 	}
-	private static string SanitizeFileName(string name)
-	{
-		return string.Join("_", name.Split(Path.GetInvalidFileNameChars()));
-	}
+	private static string SanitizeFileName(string name) => string.Join("_", name.Split(Path.GetInvalidFileNameChars()));
 }
 
 public class JsonPlaylist
@@ -176,7 +143,7 @@ public class Localizedstring
 	public string localeCode { get; set; } = "";
 	public string displayString { get; set; } = "";
 	public string localizedStringId { get; set; } = "";
-	public object? obj { get; set; } // Can be null
+	public object? obj { get; set; }
 	public int spaceRevision { get; set; }
 }
 
@@ -194,7 +161,7 @@ public class Playlist
 	public int localizedTitle { get; set; }
 	public int localizedDescription { get; set; }
 	public string defaultLanguage { get; set; } = "";
-	public Assets? assets { get; set; } // Can be null
+	public Assets? assets { get; set; }
 	public string[] tags { get; set; } = [];
 	public object[] offersTags { get; set; } = [];
 	public bool hidden { get; set; }
@@ -202,7 +169,7 @@ public class Playlist
 
 public class Assets
 {
-	public En? en { get; set; } // Can be null
+	public En? en { get; set; }
 }
 
 public class En

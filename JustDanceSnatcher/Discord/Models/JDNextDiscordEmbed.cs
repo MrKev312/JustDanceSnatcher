@@ -1,4 +1,4 @@
-﻿namespace JustDanceSnatcher;
+﻿namespace JustDanceSnatcher.Discord.Models;
 
 internal class JDNextDiscordEmbed
 {

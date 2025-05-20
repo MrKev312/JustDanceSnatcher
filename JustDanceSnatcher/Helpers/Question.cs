@@ -60,7 +60,7 @@ internal static class Question
 			if (filePath.StartsWith('"') && filePath.EndsWith('"'))
 				filePath = filePath[1..^1];
 
-			bool pathValid = (!mustExist || File.Exists(filePath)) || (canBeUrl && (filePath.StartsWith("http://") || filePath.StartsWith("https://")));
+			bool pathValid = !mustExist || File.Exists(filePath) || (canBeUrl && (filePath.StartsWith("http://") || filePath.StartsWith("https://")));
 			if (!pathValid)
 			{
 				Console.WriteLine("The specified file path is not valid or does not exist. Please try again.");

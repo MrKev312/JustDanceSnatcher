@@ -2,11 +2,9 @@
 using DSharpPlus.Entities;
 using DSharpPlus.EventArgs;
 
-using JustDanceSnatcher.Helpers;
+using JustDanceSnatcher.Interaction;
 
-using System.Text;
-
-namespace JustDanceSnatcher;
+namespace JustDanceSnatcher.Discord;
 
 internal abstract class DiscordAssetDownloaderBase<TItem, TEmbedData>
 	where TEmbedData : class, new()
@@ -76,10 +74,10 @@ internal abstract class DiscordAssetDownloaderBase<TItem, TEmbedData>
 		TItem currentItem = ItemQueue.Peek();
 		string command = GetDiscordCommandForItem(currentItem);
 		Console.WriteLine($"Sending command for item: {currentItem} -> {command}");
-		await Program.SendCommandToDiscord(command);
+		await SystemInteraction.SendCommandViaClipboard(command);
 	}
 
-	private async Task OnDiscordMessageCreatedAsync(DiscordClient sender, MessageCreateEventArgs e)
+	protected virtual async Task OnDiscordMessageCreatedAsync(DiscordClient sender, MessageCreateEventArgs e)
 	{
 		if (e.Author.IsCurrent || !e.Author.IsBot) // Process commands from non-bot users, ignore self and other bots unless overridden
 		{
@@ -95,7 +93,6 @@ internal abstract class DiscordAssetDownloaderBase<TItem, TEmbedData>
 		for (int i = 0; i < 10 && e.Message.Embeds.Count == 0; i++)
 		{
 			await Task.Delay(1000);
-			// DSharpPlus usually updates e.Message.Embeds, re-fetching message not always needed.
 		}
 
 		if (e.Message.Embeds.Count == 0)
@@ -119,7 +116,6 @@ internal abstract class DiscordAssetDownloaderBase<TItem, TEmbedData>
 			return;
 		}
 
-		// At this point, we assume the bot's response is likely for the current item in queue
 		if (ItemQueue.Count == 0)
 		{
 			Console.WriteLine("Received bot message but queue is empty. Ignoring.");
@@ -154,8 +150,6 @@ internal abstract class DiscordAssetDownloaderBase<TItem, TEmbedData>
 
 	protected virtual bool IsErrorEmbed(DiscordMessage message)
 	{
-		// Default: checks if the first embed has a field named "Error"
-		// Derived classes can override for more specific error checks.
 		if (message.Embeds.Any())
 		{
 			var firstEmbed = message.Embeds[0];
@@ -203,14 +197,12 @@ internal abstract class DiscordAssetDownloaderBase<TItem, TEmbedData>
 		else
 		{
 			Console.WriteLine("Retrying command for current item due to processing failure.");
-			// Assuming failure means we need to re-fetch/re-process from Discord command
 			await SendNextDiscordCommandAsync();
 		}
 	}
 
 	protected virtual async Task HandleUserCommandAsync(MessageCreateEventArgs e)
 	{
-		// This method is called if the message is from a non-bot user and not ourselves.
 		string content = e.Message.Content.Trim().ToLowerInvariant();
 		switch (content)
 		{

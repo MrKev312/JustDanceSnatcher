@@ -1,24 +1,23 @@
 ﻿using DSharpPlus.Entities;
 using DSharpPlus.EventArgs;
 
+using JustDanceSnatcher.Core;
+using JustDanceSnatcher.Discord.Helpers;
+using JustDanceSnatcher.Discord.Models;
 using JustDanceSnatcher.Helpers;
-using JustDanceSnatcher.UbisoftStuff; // For SongDesc
+using JustDanceSnatcher.UbisoftStuff;
 
 using System.Text.Json;
 
-using Xabe.FFmpeg.Downloader; // Keep if FFmpegDownloader is essential for this class's setup
+namespace JustDanceSnatcher.Discord;
 
-namespace JustDanceSnatcher;
-
-// Note: This class is no longer static. Instantiate it to use.
 internal class UbiArtVidUpgrader : DiscordAssetDownloaderBase<string, NoHudDiscordEmbed>
 {
-	private string _bundlesPath = string.Empty; // Equivalent to original `output`
+	private string _bundlesPath = string.Empty;
 	private string _cachePath = string.Empty;
 	private List<string> _existingMapsInCache = [];
-	private string? _mapsFolderNameInBundle; // e.g., "maps", "jd2015"
+	private string? _mapsFolderNameInBundle;
 
-	// Mapping for EmbedParserHelper
 	private static readonly IReadOnlyDictionary<string, string> NoHudFieldMap = new Dictionary<string, string>
 	{
 		{"Ultra:", nameof(NoHudDiscordEmbed.Ultra)}, {"Ultra HD:", nameof(NoHudDiscordEmbed.UltraHD)},
@@ -29,23 +28,20 @@ internal class UbiArtVidUpgrader : DiscordAssetDownloaderBase<string, NoHudDisco
 	};
 
 	protected override string BotToken => File.ReadAllText("Secret.txt").Trim();
-	protected override int ExpectedEmbedCount => 1; // /nohud usually returns 1 embed
+	protected override int ExpectedEmbedCount => 1;
 
 	protected override async Task InitializeAsync()
 	{
-		// FFmpeg download (if still needed for this specific class, otherwise remove)
-		// Task ffmpegTask = FFmpegDownloader.GetLatestVersion(FFmpegVersion.Official);
-		// await ffmpegTask; // Ensure FFmpeg is ready before proceeding if it's used by ProcessDataItemAsync
-
 		Console.Clear();
 		_bundlesPath = Question.AskFolder("Enter the path to your UbiArt game bundles: ", true);
-		_cachePath = Question.AskFolder("Enter the path to your existing upgraded maps cache (e.g., output of previous runs): ", true);
+		_cachePath = Question.AskFolder("Enter the path to your existing upgraded maps cache: ", true);
 		_existingMapsInCache = Directory.Exists(_cachePath)
 			? [.. Directory.GetDirectories(_cachePath).Select(s => Path.GetFileName(s)!)]
 			: [];
 
 		PopulateMapsToUpgrade();
 		Console.WriteLine($"Found {ItemQueue.Count} UbiArt maps to upgrade videos for.");
+		await Task.CompletedTask;
 	}
 
 	private void PopulateMapsToUpgrade()
@@ -54,18 +50,16 @@ internal class UbiArtVidUpgrader : DiscordAssetDownloaderBase<string, NoHudDisco
 		string? platform = DetectPlatformFromBundles(bundleFolders);
 		if (platform == null)
 		{
-			Console.WriteLine("Could not determine platform from bundle structure. Cannot find maps.");
+			Console.WriteLine("Could not determine platform from bundle structure.");
 			return;
 		}
 
-		// Filter out patch bundles (as in original logic)
 		bundleFolders = [.. bundleFolders.Where(f => !Path.GetFileName(f).Contains($"patch_{platform}", StringComparison.OrdinalIgnoreCase))];
-
 		List<string> mapsToProcessList = [];
 
 		foreach (string bundleFolder in bundleFolders)
 		{
-			if (_mapsFolderNameInBundle == null) // Detect maps folder name once
+			if (_mapsFolderNameInBundle == null)
 			{
 				string worldPath = Path.Combine(bundleFolder, "cache", "itf_cooked", platform, "world");
 				if (Directory.Exists(Path.Combine(worldPath, "maps")))
@@ -74,11 +68,9 @@ internal class UbiArtVidUpgrader : DiscordAssetDownloaderBase<string, NoHudDisco
 					_mapsFolderNameInBundle = "jd2015";
 				else if (Directory.Exists(Path.Combine(worldPath, "jd5")))
 					_mapsFolderNameInBundle = "jd5";
-				// Add other potential map folder names if necessary
-
 				if (_mapsFolderNameInBundle == null)
 				{
-					Console.WriteLine($"Could not find a known maps folder (e.g., 'maps', 'jd2015') in '{worldPath}'. Skipping bundle.");
+					Console.WriteLine($"Could not find maps folder in '{worldPath}'. Skipping bundle.");
 					continue;
 				}
 			}
@@ -87,8 +79,7 @@ internal class UbiArtVidUpgrader : DiscordAssetDownloaderBase<string, NoHudDisco
 			if (!Directory.Exists(mapDirectoryRootPath))
 				continue;
 
-			string[] mapSpecificFolders = Directory.GetDirectories(mapDirectoryRootPath);
-			foreach (string mapFolder in mapSpecificFolders)
+			foreach (string mapFolder in Directory.GetDirectories(mapDirectoryRootPath))
 			{
 				string songDescPath = Path.Combine(mapFolder, "songdesc.tpl.ckd");
 				if (!File.Exists(songDescPath))
@@ -96,27 +87,14 @@ internal class UbiArtVidUpgrader : DiscordAssetDownloaderBase<string, NoHudDisco
 
 				try
 				{
-					// Original JSON options from Program.cs should be fine for SongDesc
-					SongDesc songDesc = JsonSerializer.Deserialize<SongDesc>(File.ReadAllText(songDescPath).Trim('\0'), Program.jsonOptions)!;
+					SongDesc songDesc = JsonSerializer.Deserialize<SongDesc>(File.ReadAllText(songDescPath).Trim('\0'), GlobalConfig.JsonOptions)!;
 					if (songDesc.COMPONENTS == null || songDesc.COMPONENTS.Length == 0)
 						continue;
-
 					string mapName = songDesc.COMPONENTS[0].MapName;
 
-					if (string.IsNullOrWhiteSpace(mapName))
-						continue;
-					if (mapsToProcessList.Contains(mapName) || ItemQueue.Contains(mapName))
-						continue; // Already added
-					if (_existingMapsInCache.Contains(mapName, StringComparer.OrdinalIgnoreCase))
+					if (string.IsNullOrWhiteSpace(mapName) || mapsToProcessList.Contains(mapName) || ItemQueue.Contains(mapName) ||
+						_existingMapsInCache.Contains(mapName, StringComparer.OrdinalIgnoreCase) || GetVideoPathInBundles(mapName) == null)
 					{
-						// Console.WriteLine($"'{mapName}' already exists in cache. Skipping.");
-						continue;
-					}
-
-					// Check if video path exists (as per original GetVideoPath logic)
-					if (GetVideoPathInBundles(mapName) == null)
-					{
-						// Console.WriteLine($"Original video for '{mapName}' not found in bundles. Skipping upgrade candidate.");
 						continue;
 					}
 
@@ -124,12 +102,12 @@ internal class UbiArtVidUpgrader : DiscordAssetDownloaderBase<string, NoHudDisco
 				}
 				catch (Exception ex)
 				{
-					Console.WriteLine($"Error processing songdesc for map in '{mapFolder}': {ex.Message}");
+					Console.WriteLine($"Error processing songdesc for '{mapFolder}': {ex.Message}");
 				}
 			}
 		}
 
-		mapsToProcessList.Sort(); // Sort before enqueuing
+		mapsToProcessList.Sort();
 		foreach (string map in mapsToProcessList)
 			ItemQueue.Enqueue(map);
 	}
@@ -141,7 +119,6 @@ internal class UbiArtVidUpgrader : DiscordAssetDownloaderBase<string, NoHudDisco
 			string pathToPlatformDir = Path.Combine(folder, "cache", "itf_cooked");
 			if (!Directory.Exists(pathToPlatformDir))
 				continue;
-
 			string[] platformDirs = Directory.GetDirectories(pathToPlatformDir);
 			if (platformDirs.Length > 0)
 				return Path.GetFileName(platformDirs[0]);
@@ -150,41 +127,31 @@ internal class UbiArtVidUpgrader : DiscordAssetDownloaderBase<string, NoHudDisco
 		return null;
 	}
 
-	// Finds the path to the *original* video in the bundle structure.
 	private string? GetVideoPathInBundles(string mapName)
 	{
 		if (_mapsFolderNameInBundle == null)
-			return null; // Cannot determine path if maps folder name unknown
-
-		// Iterate through bundle folders to find the video for the given mapName
-		// This assumes platform is detected and _mapsFolderNameInBundle is set.
+			return null;
 		string[] bundleFolders = Directory.GetDirectories(_bundlesPath);
-		string? platform = DetectPlatformFromBundles(bundleFolders); // Re-detect or store it
+		string? platform = DetectPlatformFromBundles(bundleFolders);
 		if (platform == null)
 			return null;
-
 		bundleFolders = [.. bundleFolders.Where(f => !Path.GetFileName(f).Contains($"patch_{platform}", StringComparison.OrdinalIgnoreCase))];
 
 		foreach (string bundleFolder in bundleFolders)
 		{
-			// Path to specific map's videoscoach folder structure. UbiArt paths can be complex.
-			// Example: bundle_nx/cache/itf_cooked/nx/world/maps/MapName/videoscoach/
 			string videoCoachPath = Path.Combine(bundleFolder, "cache", "itf_cooked", platform, "world", _mapsFolderNameInBundle, mapName, "videoscoach");
 			if (Directory.Exists(videoCoachPath))
 			{
-				string[] videoFiles = Directory.GetFiles(videoCoachPath, "*.webm"); // Or other relevant extensions
+				string[] videoFiles = Directory.GetFiles(videoCoachPath, "*.webm");
 				if (videoFiles.Length > 0)
-					return videoFiles[0]; // Return path to the first found video
+					return videoFiles[0];
 			}
 		}
 
 		return null;
 	}
 
-	protected override string GetDiscordCommandForItem(string mapName)
-	{
-		return $"/nohud codename:{mapName}";
-	}
+	protected override string GetDiscordCommandForItem(string mapName) => $"/nohud codename:{mapName}";
 
 	protected override NoHudDiscordEmbed? ParseEmbedsToData(DiscordMessage message)
 	{
@@ -199,39 +166,25 @@ internal class UbiArtVidUpgrader : DiscordAssetDownloaderBase<string, NoHudDisco
 	{
 		if (string.IsNullOrWhiteSpace(songURLs.UltraHD) || songURLs.UltraHD.Equals("undefined", StringComparison.OrdinalIgnoreCase))
 		{
-			Console.WriteLine($"UltraHD URL missing or undefined for '{mapName}'. Cannot download.");
+			Console.WriteLine($"UltraHD URL missing for '{mapName}'.");
 			return false;
 		}
 
 		Console.WriteLine($"Downloading upgraded UltraHD video for '{mapName}'...");
-
-		// The destination for the new video should be the *cache* path, not the bundle path.
-		string destinationMapFolder = Path.Combine(_cachePath, mapName, "videoscoach"); // Using _cachePath as output for new videos
+		string destinationMapFolder = Path.Combine(_cachePath, mapName, "videoscoach");
 		Directory.CreateDirectory(destinationMapFolder);
-
-		// Find the original video path to determine its original filename (if needed for replacement)
-		// Or, if the new video should always be MD5-named or specific-named (e.g. mapName_ULTRA.webm)
 		string? originalVideoPath = GetVideoPathInBundles(mapName);
-		if (originalVideoPath == null)
-		{
-			Console.WriteLine($"Could not find original video path for {mapName} to replace. Saving with new name.");
-			// Fallback: save as mapName_ULTRAHD.webm or MD5 hash. For now, using MD5.
-		}
 
 		try
 		{
-			// Download the new UltraHD video. It will be named by its MD5 hash.
 			string downloadedFileName = await Download.DownloadFileMD5Async(songURLs.UltraHD, destinationMapFolder);
-
-			// If we need to replace an existing file with a specific name:
 			if (originalVideoPath != null)
 			{
 				string originalFileNameWithExt = Path.GetFileName(originalVideoPath);
-				string finalNewVideoPath = Path.Combine(destinationMapFolder, originalFileNameWithExt); // Target name is same as original
+				string finalNewVideoPath = Path.Combine(destinationMapFolder, originalFileNameWithExt);
 				string currentNewVideoPath = Path.Combine(destinationMapFolder, downloadedFileName);
-
 				if (File.Exists(finalNewVideoPath))
-					File.Delete(finalNewVideoPath); // Delete old if exists at target location with original name
+					File.Delete(finalNewVideoPath);
 				File.Move(currentNewVideoPath, finalNewVideoPath);
 				Console.WriteLine($"Replaced video for '{mapName}' at '{finalNewVideoPath}'.");
 			}
@@ -244,19 +197,14 @@ internal class UbiArtVidUpgrader : DiscordAssetDownloaderBase<string, NoHudDisco
 		}
 		catch (Exception ex)
 		{
-			Console.WriteLine($"Failed to download or move video for '{mapName}': {ex.Message}");
+			Console.WriteLine($"Failed to download/move video for '{mapName}': {ex.Message}");
 			return false;
 		}
 	}
 
-	// Override user command handling if "redo" or "retry" specific to this class are needed.
-	// The base class handles "skip", "stop", "info".
 	protected override async Task HandleUserCommandAsync(MessageCreateEventArgs e)
 	{
-		// Call base handler first for common commands
 		await base.HandleUserCommandAsync(e);
-
-		// Add specific commands for UbiArtVidUpgrader if any. Example:
 		string content = e.Message.Content.Trim().ToLowerInvariant();
 		if (content is "redo" or "!redo" or "retry" or "!retry")
 		{
@@ -264,8 +212,8 @@ internal class UbiArtVidUpgrader : DiscordAssetDownloaderBase<string, NoHudDisco
 			{
 				Console.WriteLine($"User requested redo/retry for current item: {ItemQueue.Peek()}");
 				await e.Message.RespondAsync($"Retrying command for `{ItemQueue.Peek()}`.");
-				FailCounterForCurrentItem = 0; // Reset fail counter for this item
-				await SendNextDiscordCommandAsync(); // Resend current command
+				FailCounterForCurrentItem = 0;
+				await SendNextDiscordCommandAsync();
 			}
 			else
 			{

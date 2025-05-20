@@ -9,7 +9,6 @@ public static class Download
 	{
 		HttpClient client = new();
 		client.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("gzip"));
-		// Consider adding a timeout: client.Timeout = TimeSpan.FromMinutes(5);
 		return client;
 	});
 
