@@ -7,13 +7,13 @@ Console.WriteLine("--- JustDanceSnatcher Utilities ---");
 List<string> mainOptions =
 [
 	"JDNext Download (Discord Bot)",
-			"Server Video Upgrader (Discord Bot)",
-			"UbiArt Upgrade Video (Discord Bot)",
-			"Create ContentAuthorization JSON (UbiArt Tool)",
-			"Download from ContentAuthorization JSON (UbiArt Tool)",
-			"Fix Custom Audio Volume (FFmpeg Tool)",
-			"Convert Playlist (Next to Next+ format)",
-			"Steal Covers (Manual Extraction Helper)"
+	"Server Video Upgrader (Discord Bot)",
+	"UbiArt Upgrade Video (Discord Bot)",
+	"Create ContentAuthorization JSON (UbiArt Tool)",
+	"Download from ContentAuthorization JSON (UbiArt Tool)",
+	"Fix Custom Audio Volume (FFmpeg Tool)",
+	"Convert Playlist (Next to Next+ format)",
+	"Steal Covers (Manual Extraction Helper)"
 ];
 
 int choice = Question.Ask(mainOptions, 0, "Select an operation:");
