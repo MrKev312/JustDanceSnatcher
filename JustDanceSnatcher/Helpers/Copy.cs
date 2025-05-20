@@ -8,7 +8,7 @@ public static class Copy
 
 		// Check if the source folder exists
 		if (!Directory.Exists(sourceFolder))
-			throw new Exception($"The folder {sourceFolder} doesn't exist.");
+			throw new DirectoryNotFoundException($"The folder {sourceFolder} doesn't exist.");
 
 		// Create the destination folder if it doesn't exist
 		if (!Directory.Exists(destFolder))

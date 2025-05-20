@@ -5,132 +5,149 @@ using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 
 namespace JustDanceSnatcher;
+
 internal static class PlaylistConverter
 {
-	static readonly JsonSerializerOptions options = new()
-	{
-		WriteIndented = true,
-		Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
-	};
-
-	static readonly JsonSerializerOptions writer = new()
+	// This 'writer' uses CamelCase, different from Program.jsonOptions. So it's kept separate.
+	private static readonly JsonSerializerOptions writerOptions = new()
 	{
 		WriteIndented = true,
 		Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-		// Write with lowercase property names
 		PropertyNamingPolicy = JsonNamingPolicy.CamelCase
 	};
 
 	public static void Convert()
 	{
-		// Ask for the json file
-		string jsonPath = Question.AskFile("Select the json file", true);
+		string jsonPath = Question.AskFile("Select the playlist JSON file to convert: ", true);
+		string mapsFolder = Question.AskFolder("Select the maps folder (containing SongInfo.json files): ", true);
 
-		// Read the json file
 		string json = File.ReadAllText(jsonPath);
-		// Deserialize the json file
-		PlaylistJson playlistJson = JsonSerializer.Deserialize<PlaylistJson>(json, options)!;
+		PlaylistJson? playlistJsonSource = JsonSerializer.Deserialize<PlaylistJson>(json, Program.jsonOptions);
 
-		// Ask for the maps folder
-		string mapsFolder = Question.AskFolder("Select the maps folder", true);
-
-		// Loop through each map and add it to a dictionary
-		Dictionary<Guid, string> maps = [];
-
-		string[] folders = Directory.GetDirectories(mapsFolder);
-		foreach (string file in folders)
+		if (playlistJsonSource == null)
 		{
-			string songInfo = Path.Combine(file, "SongInfo.json");
-
-			if (!File.Exists(songInfo))
-			{
-				Console.WriteLine($"SongInfo.json doesn't exist in the map folder");
-				continue;
-			}
-
-			string songInfoContent = File.ReadAllText(songInfo);
-
-			// Open as jsonobject
-			JsonObject info = JsonSerializer.Deserialize<JsonObject>(songInfoContent)!;
-
-			// Get the songId string
-			string songId = info["songID"]!.ToString()!;
-			Guid guid = Guid.Parse(songId);
-
-			// Get the song name
-			string songName = info["mapName"]!.ToString()!;
-
-			maps.Add(guid, songName);
+			Console.WriteLine("Failed to deserialize the source playlist JSON.");
+			return;
 		}
 
-		// Load the maps/../../database/config/localizedStrings.json file
+		Dictionary<Guid, string> songIdToMapNameMap = LoadSongIdToMapNameMapping(mapsFolder);
+
 		string localizedStringsPath = Path.Combine(mapsFolder, "..", "..", "database", "config", "localizedStrings.json");
-		string localizedStringsContent = File.ReadAllText(localizedStringsPath);
-		LocalizedStrings localizedStrings = JsonSerializer.Deserialize<LocalizedStrings>(localizedStringsContent, options)!;
-
-		// Create the folder maps/../../database/playlists/
-		string playlistFolder = Path.Combine(mapsFolder, "..", "..", "database", "playlists");
-		Directory.CreateDirectory(playlistFolder);
-
-		// Loop through each playlist
-		foreach (KeyValuePair<Guid, Playlist> playlist in playlistJson.playlists)
+		LocalizedStrings? localizedStrings = null;
+		if (File.Exists(localizedStringsPath))
 		{
-			// If it already exists, skip it
-			string playlistName = playlist.Value.playlistName;
-			string playlistPath = Path.Combine(playlistFolder, $"{playlistName}.json");
-			//if (File.Exists(playlistPath))
-			//{
-			//	Console.WriteLine($"Playlist {playlistName} already exists, skipping");
-			//	continue;
-			//}
+			string localizedStringsContent = File.ReadAllText(localizedStringsPath);
+			localizedStrings = JsonSerializer.Deserialize<LocalizedStrings>(localizedStringsContent, Program.jsonOptions);
+		}
+		else
+		{
+			Console.WriteLine($"Warning: Localized strings file not found at '{localizedStringsPath}'. Titles and descriptions might be Oasis IDs.");
+		}
 
-			// If the playlist is dynamic, skip it
-			if (playlistJson.dynamicPlaylists.Contains(playlist.Key))
+		string outputPlaylistFolder = Path.Combine(mapsFolder, "..", "..", "database", "playlists");
+		Directory.CreateDirectory(outputPlaylistFolder);
+
+		foreach (KeyValuePair<Guid, Playlist> playlistEntry in playlistJsonSource.playlists)
+		{
+			Guid playlistGuid = playlistEntry.Key;
+			Playlist sourcePlaylist = playlistEntry.Value;
+
+			if (playlistJsonSource.dynamicPlaylists.Contains(playlistGuid))
 			{
-				Console.WriteLine($"Playlist {playlist.Value.playlistName} is dynamic, skipping");
+				Console.WriteLine($"Playlist '{sourcePlaylist.playlistName}' ({playlistGuid}) is dynamic. Skipping.");
 				continue;
 			}
 
-			JsonPlaylist jsonPlaylist = new()
+			Console.WriteLine($"Processing playlist: {sourcePlaylist.playlistName}");
+
+			JsonPlaylist newPlaylist = new()
 			{
-				Guid = playlist.Key,
-				PlaylistName = playlist.Value.playlistName,
-				LocalizedTitle = localizedStrings.localizedStrings.FirstOrDefault(x => x.oasisId == playlist.Value.localizedTitle.ToString())?.displayString ?? "",
-				LocalizedDescription = localizedStrings.localizedStrings.FirstOrDefault(x => x.oasisId == playlist.Value.localizedDescription.ToString())?.displayString ?? "",
-				CoverUrl = playlist.Value.assets.en.cover,
-				CoverDetailsUrl = playlist.Value.assets.en.coverDetails,
-				Tags = playlist.Value.tags.Length != 0 ? playlist.Value.tags : null
+				Guid = playlistGuid,
+				PlaylistName = sourcePlaylist.playlistName,
+				CoverUrl = sourcePlaylist.assets?.en?.cover ?? string.Empty,
+				CoverDetailsUrl = sourcePlaylist.assets?.en?.coverDetails ?? string.Empty,
+				Tags = sourcePlaylist.tags?.Length > 0 ? sourcePlaylist.tags : null
 			};
 
-			// Loop through each item in the playlist
-			foreach (Itemlist item in playlist.Value.itemList)
+			if (localizedStrings != null)
 			{
-				// If the item is a map, add it to the list
-				if (item.type == "map")
+				newPlaylist.LocalizedTitle = localizedStrings.localizedStrings
+					.FirstOrDefault(x => x.oasisId == sourcePlaylist.localizedTitle.ToString())?.displayString ?? sourcePlaylist.localizedTitle.ToString();
+				newPlaylist.LocalizedDescription = localizedStrings.localizedStrings
+					.FirstOrDefault(x => x.oasisId == sourcePlaylist.localizedDescription.ToString())?.displayString ?? sourcePlaylist.localizedDescription.ToString();
+			}
+			else
+			{
+				newPlaylist.LocalizedTitle = sourcePlaylist.localizedTitle.ToString(); // Fallback to ID
+				newPlaylist.LocalizedDescription = sourcePlaylist.localizedDescription.ToString(); // Fallback to ID
+			}
+
+
+			foreach (Itemlist item in sourcePlaylist.itemList)
+			{
+				if (item.type == "map" && Guid.TryParse(item.id, out Guid mapGuid))
 				{
-					// Get the guid from the id
-					Guid guid = Guid.Parse(item.id);
-					// If the guid is in the maps dictionary, add it to the playlist
-					if (maps.TryGetValue(guid, out string? value))
+					if (songIdToMapNameMap.TryGetValue(mapGuid, out string? mapName))
 					{
-						jsonPlaylist.ItemList.Add(value);
+						newPlaylist.ItemList.Add(mapName);
 					}
 					else
 					{
-						Console.WriteLine($"Map {guid} not found in the maps folder");
+						Console.WriteLine($"Warning: Map with ID '{mapGuid}' not found in local maps folder for playlist '{sourcePlaylist.playlistName}'.");
 					}
 				}
 				else
 				{
-					Console.WriteLine("Item is not a map, skipping");
-					Console.WriteLine($"Item type: {item.type}");
+					Console.WriteLine($"Skipping non-map item or item with invalid ID: Type='{item.type}', ID='{item.id}' in playlist '{sourcePlaylist.playlistName}'.");
 				}
 			}
 
-			string finalJson = JsonSerializer.Serialize(jsonPlaylist, writer);
-
-			File.WriteAllText(playlistPath, finalJson);
+			string outputJsonPath = Path.Combine(outputPlaylistFolder, $"{SanitizeFileName(newPlaylist.PlaylistName)}.json");
+			string finalJson = JsonSerializer.Serialize(newPlaylist, writerOptions);
+			File.WriteAllText(outputJsonPath, finalJson);
+			Console.WriteLine($"Converted playlist '{newPlaylist.PlaylistName}' saved to '{outputJsonPath}'.");
 		}
+	}
+
+	private static Dictionary<Guid, string> LoadSongIdToMapNameMapping(string mapsFolder)
+	{
+		Dictionary<Guid, string> map = [];
+		string[] individualMapFolders = Directory.GetDirectories(mapsFolder);
+
+		foreach (string mapFolder in individualMapFolders)
+		{
+			string songInfoPath = Path.Combine(mapFolder, "SongInfo.json");
+			if (!File.Exists(songInfoPath))
+			{
+				Console.WriteLine($"Warning: SongInfo.json not found in '{mapFolder}'. Skipping for playlist conversion mapping.");
+				continue;
+			}
+
+			try
+			{
+				string songInfoContent = File.ReadAllText(songInfoPath);
+				JsonObject? info = JsonSerializer.Deserialize<JsonObject>(songInfoContent);
+
+				if (info != null && info.TryGetPropertyValue("songID", out JsonNode? songIdNode) &&
+					info.TryGetPropertyValue("mapName", out JsonNode? mapNameNode))
+				{
+					if (Guid.TryParse(songIdNode!.GetValue<string>(), out Guid songGuid))
+					{
+						map[songGuid] = mapNameNode!.GetValue<string>();
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error reading SongInfo from '{songInfoPath}': {ex.Message}");
+			}
+		}
+
+		return map;
+	}
+	private static string SanitizeFileName(string name)
+	{
+		return string.Join("_", name.Split(Path.GetInvalidFileNameChars()));
 	}
 }
 
@@ -144,60 +161,58 @@ public class JsonPlaylist
 	public string CoverDetailsUrl { get; set; } = "";
 	[JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
 	public string[]? Tags { get; set; }
-
-	// The maps
 	public List<string> ItemList { get; set; } = [];
 }
 
 public class LocalizedStrings
 {
-	public string spaceId { get; set; }
-	public Localizedstring[] localizedStrings { get; set; }
+	public string spaceId { get; set; } = "";
+	public Localizedstring[] localizedStrings { get; set; } = [];
 }
 
 public class Localizedstring
 {
-	public string oasisId { get; set; }
-	public string localeCode { get; set; }
-	public string displayString { get; set; }
-	public string localizedStringId { get; set; }
-	public object obj { get; set; }
+	public string oasisId { get; set; } = "";
+	public string localeCode { get; set; } = "";
+	public string displayString { get; set; } = "";
+	public string localizedStringId { get; set; } = "";
+	public object? obj { get; set; } // Can be null
 	public int spaceRevision { get; set; }
 }
 
 public class PlaylistJson
 {
-	public Dictionary<Guid, Playlist> playlists { get; set; }
-	public Guid[] dynamicPlaylists { get; set; }
+	public Dictionary<Guid, Playlist> playlists { get; set; } = [];
+	public Guid[] dynamicPlaylists { get; set; } = [];
 }
 
 public class Playlist
 {
-	public string playlistName { get; set; }
-	public Itemlist[] itemList { get; set; }
-	public string listSource { get; set; }
+	public string playlistName { get; set; } = "";
+	public Itemlist[] itemList { get; set; } = [];
+	public string listSource { get; set; } = "";
 	public int localizedTitle { get; set; }
 	public int localizedDescription { get; set; }
-	public string defaultLanguage { get; set; }
-	public Assets assets { get; set; }
-	public string[] tags { get; set; }
-	public object[] offersTags { get; set; }
+	public string defaultLanguage { get; set; } = "";
+	public Assets? assets { get; set; } // Can be null
+	public string[] tags { get; set; } = [];
+	public object[] offersTags { get; set; } = [];
 	public bool hidden { get; set; }
 }
 
 public class Assets
 {
-	public En en { get; set; }
+	public En? en { get; set; } // Can be null
 }
 
 public class En
 {
-	public string cover { get; set; }
-	public string coverDetails { get; set; }
+	public string cover { get; set; } = "";
+	public string coverDetails { get; set; } = "";
 }
 
 public class Itemlist
 {
-	public string id { get; set; }
-	public string type { get; set; }
+	public string id { get; set; } = "";
+	public string type { get; set; } = "";
 }

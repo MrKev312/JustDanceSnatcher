@@ -1,137 +1,173 @@
 ﻿using System.Security.Cryptography;
+using System.Net.Http.Headers;
 
 namespace JustDanceSnatcher.Helpers;
 
 public static class Download
 {
-	static readonly Lazy<HttpClient> client = new(() =>
+	private static readonly Lazy<HttpClient> _lazyClient = new(() =>
 	{
 		HttpClient client = new();
-		client.DefaultRequestHeaders.AcceptEncoding.Add(new System.Net.Http.Headers.StringWithQualityHeaderValue("gzip"));
+		client.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("gzip"));
+		// Consider adding a timeout: client.Timeout = TimeSpan.FromMinutes(5);
 		return client;
 	});
 
+	private static HttpClient HttpClient => _lazyClient.Value;
+
 	/// <summary>
-	/// Downloads a file from a URL to a folder and renames it to the MD5 hash of the file if no filename is provided
+	/// Downloads a file from a URL. If filename is null, the file is named by its MD5 hash.
 	/// </summary>
-	/// <returns>The name of the file</returns>
-	public static string DownloadFileMD5(string url, string folderPath, string? filename = null, bool errorIfFileExists = false)
+	/// <returns>The final filename (hash.ext or provided filename.ext) within the folderPath.</returns>
+	public static async Task<string> DownloadFileMD5Async(string url, string folderPath, string? filename = null, bool errorIfFileExists = false, int maxRetries = 3)
 	{
-		// Create the destination folder if it doesn't exist
 		Directory.CreateDirectory(folderPath);
-
-		// Get the extension of the file
 		Uri uri = new(url);
-		string urlFileName = uri.Segments.Last();
+		string urlFileName = uri.Segments.LastOrDefault() ?? "unknown_file";
+		string descriptiveName = uri.Segments.Length > 1 ? uri.Segments[^2].Trim('/') : urlFileName;
 
-		// Second to last segment is the folder name
-		string thingDownloading = uri.Segments[^2].Trim('/');
+		string finalTargetFilePath = Path.Combine(folderPath, urlFileName);
+		string downloadTempPath;
 
-		// Download the file as "temp"
-		string tempFilePath;
 		if (filename == null)
-			tempFilePath = Path.Combine(folderPath, "temp");
+		{
+			downloadTempPath = Path.Combine(folderPath, Path.GetRandomFileName()); // Unique temp file
+		}
 		else
-			tempFilePath = Path.Combine(folderPath, $"{filename}{Path.GetExtension(urlFileName)}");
+		{
+			finalTargetFilePath = Path.Combine(folderPath, $"{filename}{Path.GetExtension(urlFileName)}");
+			if (File.Exists(finalTargetFilePath))
+			{
+				if (errorIfFileExists)
+					throw new IOException($"File '{finalTargetFilePath}' already exists and errorIfFileExists is true.");
 
-		try
-		{
-			client.Value.DefaultRequestHeaders.AcceptEncoding.Add(new System.Net.Http.Headers.StringWithQualityHeaderValue("gzip"));
-			using HttpResponseMessage response = client.Value.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead).Result;
-			response.EnsureSuccessStatusCode();
-			long? contentLength = response.Content.Headers.ContentLength;
-			if (contentLength.HasValue)
-				Console.WriteLine($"Downloading {thingDownloading} ({contentLength.Value / 1024 / 1024} MB)");
-			using Stream download = response.Content.ReadAsStream();
-			using FileStream fileStream = File.Create(tempFilePath);
-			// Copy with 10 MB buffer
-			download.CopyTo(fileStream, 10 * 1024 * 1024);
-		}
-		catch (Exception e)
-		{
-			throw new Exception($"Failed to download the file: {e.Message}");
+				Console.WriteLine($"File '{finalTargetFilePath}' already exists, skipping download.");
+				return Path.GetFileName(finalTargetFilePath);
+			}
+
+			downloadTempPath = finalTargetFilePath; // Download directly to target
 		}
 
-		if (filename != null)
-			return tempFilePath;
+		for (int attempt = 0; attempt < maxRetries; attempt++)
+		{
+			try
+			{
+				using HttpResponseMessage response = await HttpClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
+				response.EnsureSuccessStatusCode();
 
-		// Get the MD5 hash of the file
-		string hashString = GetFileMD5(tempFilePath) + Path.GetExtension(urlFileName);
+				long? contentLength = response.Content.Headers.ContentLength;
+				Console.WriteLine(contentLength.HasValue
+					? $"Downloading {descriptiveName} ({contentLength.Value / 1024 / 1024} MB) (Attempt {attempt + 1})"
+					: $"Downloading {descriptiveName} (Attempt {attempt + 1})");
 
-		// Rename the file to the MD5 hash
-		string filePath = Path.Combine(folderPath, hashString);
+				using Stream downloadStream = await response.Content.ReadAsStreamAsync();
+				using FileStream fileStream = File.Create(downloadTempPath);
+				await downloadStream.CopyToAsync(fileStream);
+				await fileStream.FlushAsync();
+				// fileStream is disposed here, releasing the file
+
+				if (filename == null) // MD5 logic
+				{
+					string hash = GetFileMD5(downloadTempPath);
+					finalTargetFilePath = Path.Combine(folderPath, hash + Path.GetExtension(urlFileName));
+
+					if (File.Exists(finalTargetFilePath))
+					{
+						File.Delete(downloadTempPath); // Clean up temp file
+						if (errorIfFileExists)
+							throw new IOException($"Hashed file '{finalTargetFilePath}' already exists and errorIfFileExists is true.");
+
+						Console.WriteLine($"Hashed file '{finalTargetFilePath}' (from {urlFileName}) already exists.");
+						return Path.GetFileName(finalTargetFilePath);
+					}
+
+					File.Move(downloadTempPath, finalTargetFilePath, true);
+					return Path.GetFileName(finalTargetFilePath);
+				}
+
+				// Filename was provided, downloadTempPath is finalTargetFilePath
+				return Path.GetFileName(finalTargetFilePath);
+			}
+			catch (Exception e)
+			{
+				Console.WriteLine($"Error downloading '{url}' to '{downloadTempPath}': {e.Message}");
+				if (File.Exists(downloadTempPath) && filename == null) // Clean up temp if it's a dedicated temp file
+				{
+					try
+					{
+						File.Delete(downloadTempPath);
+					}
+					catch { /* best effort */ }
+				}
+
+				if (attempt == maxRetries - 1)
+					throw; // Rethrow on last attempt
+
+				Console.WriteLine($"Retrying in {attempt + 1}s... ({attempt + 1}/{maxRetries})");
+				await Task.Delay(TimeSpan.FromSeconds(attempt + 1));
+			}
+		}
+		// Should be unreachable if maxRetries > 0
+		throw new Exception($"Failed to download file '{url}' after {maxRetries} retries.");
+	}
+
+	public static async Task DownloadFileAsync(string url, string folderPath, string? fileName = null, bool errorIfFileExists = false, int maxRetries = 3)
+	{
+		Uri uri = new(url);
+		fileName ??= uri.Segments.LastOrDefault() ?? "unknown_file";
+		string filePath = Path.Combine(folderPath, fileName);
+
+		Directory.CreateDirectory(folderPath);
 
 		if (File.Exists(filePath))
 		{
 			if (errorIfFileExists)
-				throw new Exception($"The file {urlFileName} already exists.");
+				throw new IOException($"File '{filePath}' already exists and errorIfFileExists is true.");
 
-			Console.WriteLine($"The file {urlFileName} already exists, skipping.");
-			return hashString;
+			Console.WriteLine($"File '{filePath}' already exists, skipping download.");
+			return;
 		}
 
-		File.Move(tempFilePath, filePath, true);
-
-		return hashString;
-	}
-
-	private static string DownloadFileMD5Retry(string url, string folderPath, string? filename, bool errorIfFileExists = false)
-	{
-		for (int i = 0; i < 10; i++)
+		for (int attempt = 0; attempt < maxRetries; attempt++)
 		{
 			try
 			{
-				return DownloadFileMD5(url, folderPath, filename, errorIfFileExists);
+				using HttpResponseMessage response = await HttpClient.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
+				response.EnsureSuccessStatusCode();
+
+				Console.WriteLine($"Downloading to '{filePath}' (Attempt {attempt + 1})");
+
+				using Stream downloadStream = await response.Content.ReadAsStreamAsync();
+				using FileStream fileStream = File.Create(filePath);
+				await downloadStream.CopyToAsync(fileStream);
+				await fileStream.FlushAsync();
+				return; // Success
 			}
 			catch (Exception e)
 			{
-				Console.WriteLine($"Error downloading file: {e.Message}");
-				Console.WriteLine($"Retrying... ({i + 1}/10)");
+				Console.WriteLine($"Error downloading file to '{filePath}': {e.Message}");
+				if (File.Exists(filePath))
+				{
+					try
+					{
+						File.Delete(filePath); } catch { /* best effort */ }
+				} // Clean up partial file
+
+				if (attempt == maxRetries - 1)
+					throw;
+
+				Console.WriteLine($"Retrying in {attempt + 1}s... ({attempt + 1}/{maxRetries})");
+				await Task.Delay(TimeSpan.FromSeconds(attempt + 1));
 			}
 		}
 
-		throw new Exception("Failed to download the file.");
-	}
-
-	public static Task<string> DownloadFileMD5Async(string url, string folderPath, string? filename = null, bool errorIfFileExists = false)
-	{
-		return Task.Run(() => DownloadFileMD5Retry(url, folderPath, filename, errorIfFileExists));
+		throw new Exception($"Failed to download file to '{filePath}' after {maxRetries} retries.");
 	}
 
 	public static string GetFileMD5(string filePath)
 	{
-		// Get a stream from the file
 		using FileStream fileStream = File.Open(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
 		byte[] hash = MD5.HashData(fileStream);
-
-		// Convert the byte array to a hex string
-		string hashString = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
-
-		return hashString;
-	}
-
-	public static void DownloadFile(string url, string folderPath, string? fileName = null, bool errorIfFileExists = false)
-	{
-		Uri uri = new(url);
-
-		fileName ??= uri.Segments.Last();
-
-		string filePath = Path.Combine(folderPath, fileName);
-
-		if (File.Exists(filePath))
-		{
-			if (errorIfFileExists)
-				throw new Exception($"The file {fileName} already exists.");
-
-			Console.WriteLine($"The file {fileName} already exists, skipping.");
-			return;
-		}
-
-		Directory.CreateDirectory(folderPath);
-
-		using HttpClient client = new();
-		using Stream stream = client.GetStreamAsync(url).Result;
-		using FileStream fileStream = File.Create(filePath);
-		stream.CopyTo(fileStream);
+		return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
 	}
 }

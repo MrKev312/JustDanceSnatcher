@@ -27,6 +27,11 @@ public class JDNextDatabaseEntry
 	public object title { get; set; }
 	[JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
 	public Assets? assets { get; set; }
+
+	public override string ToString()
+	{
+		return mapName?.ToString() ?? "Unknown Map";
+	}
 }
 
 public class Assetsmetadata

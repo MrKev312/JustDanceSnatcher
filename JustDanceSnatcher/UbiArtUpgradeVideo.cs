@@ -1,416 +1,276 @@
-﻿using DSharpPlus;
-using DSharpPlus.Entities;
+﻿using DSharpPlus.Entities;
 using DSharpPlus.EventArgs;
 
 using JustDanceSnatcher.Helpers;
-using JustDanceSnatcher.UbisoftStuff;
+using JustDanceSnatcher.UbisoftStuff; // For SongDesc
 
-using System.Text;
 using System.Text.Json;
 
-using Xabe.FFmpeg.Downloader;
+using Xabe.FFmpeg.Downloader; // Keep if FFmpegDownloader is essential for this class's setup
 
 namespace JustDanceSnatcher;
 
-internal class UbiArtUpgradeVideo
+// Note: This class is no longer static. Instantiate it to use.
+internal class UbiArtVidUpgrader : DiscordAssetDownloaderBase<string, NoHudDiscordEmbed>
 {
-	// Queue of map IDs
-	readonly static Queue<string> maps = [];
-	static List<string> existingMaps = [];
-	static string output = string.Empty;
-	static uint failCounter = 0;
-	static bool downloading = false;
+	private string _bundlesPath = string.Empty; // Equivalent to original `output`
+	private string _cachePath = string.Empty;
+	private List<string> _existingMapsInCache = [];
+	private string? _mapsFolderNameInBundle; // e.g., "maps", "jd2015"
 
-	public static async Task Run()
+	// Mapping for EmbedParserHelper
+	private static readonly IReadOnlyDictionary<string, string> NoHudFieldMap = new Dictionary<string, string>
 	{
-		Task ffmpegTask = FFmpegDownloader.GetLatestVersion(FFmpegVersion.Official);
+		{"Ultra:", nameof(NoHudDiscordEmbed.Ultra)}, {"Ultra HD:", nameof(NoHudDiscordEmbed.UltraHD)},
+		{"High:", nameof(NoHudDiscordEmbed.High)}, {"High HD:", nameof(NoHudDiscordEmbed.HighHD)},
+		{"Mid:", nameof(NoHudDiscordEmbed.Mid)}, {"Mid HD:", nameof(NoHudDiscordEmbed.MidHD)},
+		{"Low:", nameof(NoHudDiscordEmbed.Low)}, {"Low HD:", nameof(NoHudDiscordEmbed.LowHD)},
+		{"Audio:", nameof(NoHudDiscordEmbed.Audio)}
+	};
+
+	protected override string BotToken => File.ReadAllText("Secret.txt").Trim();
+	protected override int ExpectedEmbedCount => 1; // /nohud usually returns 1 embed
+
+	protected override async Task InitializeAsync()
+	{
+		// FFmpeg download (if still needed for this specific class, otherwise remove)
+		// Task ffmpegTask = FFmpegDownloader.GetLatestVersion(FFmpegVersion.Official);
+		// await ffmpegTask; // Ensure FFmpeg is ready before proceeding if it's used by ProcessDataItemAsync
 
 		Console.Clear();
-		// Ask for the path to the cache.json file
-		output = Question.AskFolder("Enter the path to your bundles: ", true);
-		string cacheLocation = Question.AskFolder("Enter the path to your cache: ", true);
-		existingMaps = Directory.GetDirectories(cacheLocation).Select(x => Path.GetFileName(x)).ToList();
+		_bundlesPath = Question.AskFolder("Enter the path to your UbiArt game bundles: ", true);
+		_cachePath = Question.AskFolder("Enter the path to your existing upgraded maps cache (e.g., output of previous runs): ", true);
+		_existingMapsInCache = Directory.Exists(_cachePath)
+			? [.. Directory.GetDirectories(_cachePath).Select(s => Path.GetFileName(s)!)]
+			: [];
 
-		// Get the maps
-		GetMaps();
-
-		// Create a new DiscordClientBuilder
-		Console.WriteLine("Starting discord bot!");
-
-		string token = File.ReadAllText("Secret.txt").Trim();
-
-		DiscordClient discord = new(new DiscordConfiguration()
-		{
-			Token = token,
-			TokenType = TokenType.Bot,
-			Intents = DiscordIntents.MessageContents | DiscordIntents.AllUnprivileged
-		});
-
-		// Add the message created event
-		discord.MessageCreated += OnMessageCreated;
-
-		// Connect to Discord
-		await discord.ConnectAsync();
-		await ffmpegTask;
-
-		Console.WriteLine($"Downloading {maps.Count} map ids");
-
-		// Set the clipboard to the first map ID
-		if (maps.Count != 0)
-			UpdateClipboard();
-		else
-			return;
-
-		// Wait for the bot to disconnect
-		await Task.Delay(-1);
+		PopulateMapsToUpgrade();
+		Console.WriteLine($"Found {ItemQueue.Count} UbiArt maps to upgrade videos for.");
 	}
 
-	private static void UpdateClipboard() => Program.SetClipboard($"/nohud codename:{maps.Peek()}");
-
-	static string? GetVideoPath(string songID)
+	private void PopulateMapsToUpgrade()
 	{
-		// Get the path to the video
-		string path = Path.Combine("world", mapsName!, songID, "videoscoach");
-		List<string> paths = [];
-
-		foreach (string folder in Directory.GetDirectories(output))
+		string[] bundleFolders = Directory.GetDirectories(_bundlesPath);
+		string? platform = DetectPlatformFromBundles(bundleFolders);
+		if (platform == null)
 		{
-			string videoPath = Path.Combine(folder, path);
-			if (!Directory.Exists(videoPath))
-				continue;
-
-			string[] videoFiles = Directory.GetFiles(videoPath, "*.webm");
-			paths.AddRange(videoFiles);
-		}
-
-		// Return the path
-		return paths.Count == 0 ? null : paths[0];
-	}
-
-	static string? mapsName = null;
-	static void GetMaps()
-	{
-		// Get the name of each folder in the output directory
-		string[] folders = Directory.GetDirectories(output);
-		string? platform = null;
-
-		// Get the platform
-		foreach (string folder in folders)
-		{
-			string pathToPlatform = Path.Combine(folder, "cache", "itf_cooked");
-			if (!Directory.Exists(pathToPlatform))
-				continue;
-
-			string[] dirs = Directory.GetDirectories(pathToPlatform);
-			if (dirs.Length == 0)
-				continue;
-
-			platform = Path.GetFileName(dirs[0]);
-			break;
-		}
-
-		if (platform is null)
-		{
-			Console.WriteLine("Couldn't find the platform folder");
+			Console.WriteLine("Could not determine platform from bundle structure. Cannot find maps.");
 			return;
 		}
 
-		// remove "bundle_{platform}" and "patch_{platform}" from the list
-		folders = folders.Where(x => !x.Contains($"patch_{platform}", StringComparison.OrdinalIgnoreCase)).ToArray();
+		// Filter out patch bundles (as in original logic)
+		bundleFolders = [.. bundleFolders.Where(f => !Path.GetFileName(f).Contains($"patch_{platform}", StringComparison.OrdinalIgnoreCase))];
 
-		List<string> mapsList = [];
+		List<string> mapsToProcessList = [];
 
-		foreach (string bundleFolder in folders)
+		foreach (string bundleFolder in bundleFolders)
 		{
-			if (mapsName is null)
+			if (_mapsFolderNameInBundle == null) // Detect maps folder name once
 			{
-				string mapNameFolder = Path.Combine(bundleFolder, "cache", "itf_cooked", platform, "world");
-				if (Directory.Exists(Path.Combine(mapNameFolder, "maps")))
-					mapsName = "maps";
-				else if (Directory.Exists(Path.Combine(mapNameFolder, "jd2015")))
-					mapsName = "jd2015";
-				else if (Directory.Exists(Path.Combine(mapNameFolder, "jd5")))
-					mapsName = "jd5";
+				string worldPath = Path.Combine(bundleFolder, "cache", "itf_cooked", platform, "world");
+				if (Directory.Exists(Path.Combine(worldPath, "maps")))
+					_mapsFolderNameInBundle = "maps";
+				else if (Directory.Exists(Path.Combine(worldPath, "jd2015")))
+					_mapsFolderNameInBundle = "jd2015";
+				else if (Directory.Exists(Path.Combine(worldPath, "jd5")))
+					_mapsFolderNameInBundle = "jd5";
+				// Add other potential map folder names if necessary
 
-				if (mapsName is null)
+				if (_mapsFolderNameInBundle == null)
 				{
-					Console.WriteLine("Couldn't find the maps folder");
-					return;
+					Console.WriteLine($"Could not find a known maps folder (e.g., 'maps', 'jd2015') in '{worldPath}'. Skipping bundle.");
+					continue;
 				}
 			}
 
-			// For each folder
-			string mapDirectoryPath = Path.Combine(bundleFolder, "cache", "itf_cooked", platform, "world", mapsName);
-			if (!Directory.Exists(mapDirectoryPath))
+			string mapDirectoryRootPath = Path.Combine(bundleFolder, "cache", "itf_cooked", platform, "world", _mapsFolderNameInBundle);
+			if (!Directory.Exists(mapDirectoryRootPath))
 				continue;
-			string[] mapsFolders = Directory.GetDirectories(mapDirectoryPath);
 
-			foreach (string map in mapsFolders)
+			string[] mapSpecificFolders = Directory.GetDirectories(mapDirectoryRootPath);
+			foreach (string mapFolder in mapSpecificFolders)
 			{
-				// If the songdesc doesn't exist, skip
-				string songDescPath = Path.Combine(map, "songdesc.tpl.ckd");
+				string songDescPath = Path.Combine(mapFolder, "songdesc.tpl.ckd");
 				if (!File.Exists(songDescPath))
 					continue;
 
-				SongDesc songDesc = JsonSerializer.Deserialize<SongDesc>(File.ReadAllText(songDescPath).Trim('\0'), Program.jsonOptions)!;
-
-				string mapName = songDesc.COMPONENTS[0].MapName;
-
-				// If it's already in the queue, skip
-				if (maps.Contains(mapName))
+				try
 				{
-					Console.WriteLine($"{mapName} is already in the queue");
-					continue;
-				}
+					// Original JSON options from Program.cs should be fine for SongDesc
+					SongDesc songDesc = JsonSerializer.Deserialize<SongDesc>(File.ReadAllText(songDescPath).Trim('\0'), Program.jsonOptions)!;
+					if (songDesc.COMPONENTS == null || songDesc.COMPONENTS.Length == 0)
+						continue;
 
-				// If the mapname is already in the cache, skip
-				if (existingMaps.Contains(mapName, StringComparer.OrdinalIgnoreCase))
+					string mapName = songDesc.COMPONENTS[0].MapName;
+
+					if (string.IsNullOrWhiteSpace(mapName))
+						continue;
+					if (mapsToProcessList.Contains(mapName) || ItemQueue.Contains(mapName))
+						continue; // Already added
+					if (_existingMapsInCache.Contains(mapName, StringComparer.OrdinalIgnoreCase))
+					{
+						// Console.WriteLine($"'{mapName}' already exists in cache. Skipping.");
+						continue;
+					}
+
+					// Check if video path exists (as per original GetVideoPath logic)
+					if (GetVideoPathInBundles(mapName) == null)
+					{
+						// Console.WriteLine($"Original video for '{mapName}' not found in bundles. Skipping upgrade candidate.");
+						continue;
+					}
+
+					mapsToProcessList.Add(mapName);
+				}
+				catch (Exception ex)
 				{
-					Console.WriteLine($"{mapName} is already in the cache");
-					continue;
+					Console.WriteLine($"Error processing songdesc for map in '{mapFolder}': {ex.Message}");
 				}
-
-				string? videoName = GetVideoPath(mapName);
-				if (videoName is null)
-				{
-					Console.WriteLine($"Couldn't find the video for {mapName}");
-					continue;
-				}
-
-				// Add the songDesc name to the queue
-				mapsList.Add(mapName);
 			}
 		}
 
-		// Sort the list
-		mapsList.Sort();
-
-		// Add the list to the queue
-		foreach (string map in mapsList)
-			maps.Enqueue(map);
-
-		// Now we have a list of all the songs we need to download
-		Console.WriteLine($"We have to download {maps.Count} songs!");
+		mapsToProcessList.Sort(); // Sort before enqueuing
+		foreach (string map in mapsToProcessList)
+			ItemQueue.Enqueue(map);
 	}
 
-	public static async Task OnMessageCreated(DiscordClient client, MessageCreateEventArgs e)
+	private static string? DetectPlatformFromBundles(string[] bundleFolders)
 	{
-		ArgumentNullException.ThrowIfNull(client);
-
-		ArgumentNullException.ThrowIfNull(e);
-
-		// If the message is from ourselves, ignore it
-		if (e.Author.IsCurrent)
-			return;
-
-		// If the author is not a bot, ignore it
-		if (!e.Author.IsBot)
+		foreach (string folder in bundleFolders)
 		{
-			// If the message content is "skip", pop the first map ID and copy the command to the clipboard
-			string message = e.Message.Content.ToLower();
-			switch (message)
+			string pathToPlatformDir = Path.Combine(folder, "cache", "itf_cooked");
+			if (!Directory.Exists(pathToPlatformDir))
+				continue;
+
+			string[] platformDirs = Directory.GetDirectories(pathToPlatformDir);
+			if (platformDirs.Length > 0)
+				return Path.GetFileName(platformDirs[0]);
+		}
+
+		return null;
+	}
+
+	// Finds the path to the *original* video in the bundle structure.
+	private string? GetVideoPathInBundles(string mapName)
+	{
+		if (_mapsFolderNameInBundle == null)
+			return null; // Cannot determine path if maps folder name unknown
+
+		// Iterate through bundle folders to find the video for the given mapName
+		// This assumes platform is detected and _mapsFolderNameInBundle is set.
+		string[] bundleFolders = Directory.GetDirectories(_bundlesPath);
+		string? platform = DetectPlatformFromBundles(bundleFolders); // Re-detect or store it
+		if (platform == null)
+			return null;
+
+		bundleFolders = [.. bundleFolders.Where(f => !Path.GetFileName(f).Contains($"patch_{platform}", StringComparison.OrdinalIgnoreCase))];
+
+		foreach (string bundleFolder in bundleFolders)
+		{
+			// Path to specific map's videoscoach folder structure. UbiArt paths can be complex.
+			// Example: bundle_nx/cache/itf_cooked/nx/world/maps/MapName/videoscoach/
+			string videoCoachPath = Path.Combine(bundleFolder, "cache", "itf_cooked", platform, "world", _mapsFolderNameInBundle, mapName, "videoscoach");
+			if (Directory.Exists(videoCoachPath))
 			{
-				case "skip":
-				case "next":
-					maps.Dequeue();
-					UpdateClipboard();
-					await e.Message.RespondAsync($"Skipping to {maps.Peek()}");
-					return;
-				case "stop":
-				case "exit":
-				case "quit":
-					Console.WriteLine("We stopping bois!");
-					await e.Message.RespondAsync("Aight, we stoppin");
-
-					// Disconnect the bot
-					await client.DisconnectAsync();
-					Environment.Exit(0);
-					break;
-				case "redo":
-				case "retry":
-					// Set clipboard again just in case
-					UpdateClipboard();
-					// Press ctrl+v to paste the command
-					SendKeys.SendWait("^v");
-					// Wait for .5 seconds
-					await Task.Delay(100);
-					// Press enter to send the command
-					SendKeys.SendWait("{ENTER}");
-					break;
-				case "status":
-				case "info":
-					// If we have no map IDs left, return
-					if (maps.Count != 0)
-						// Say which song we're currently on and how many are left
-						await e.Message.RespondAsync($"Currently on {maps.Peek()}. {maps.Count} songs left. We're {(downloading ? "" : "not")} downloading!");
-					else
-						// Say that we're done
-						await e.Message.RespondAsync("We're done here!");
-					return;
-			}
-
-			// If the message content is not "skip" or "stop", ignore it
-			return;
-		}
-
-		if (downloading)
-		{
-			await e.Message.RespondAsync("We're currently downloading a video, please wait!");
-			await e.Message.CreateReactionAsync(DiscordEmoji.FromName(client, ":x:"));
-			return;
-		}
-
-		// Add a checkmark reaction to the message
-		await e.Message.CreateReactionAsync(DiscordEmoji.FromName(client, ":white_check_mark:"));
-
-		// If there's no embeds, wait for 1 second and recount the embeds up to a max of 10 times
-		for (int i = 0; i < 10 && (e.Message.Embeds.Count == 0 || e.Message.Embeds[0].Fields == null); i++)
-			await Task.Delay(1000);
-
-		StringBuilder response = new();
-
-		response.Append($"This message has {e.Message.Embeds.Count} embeds.\n");
-
-		// If the message does not have 1 embeds, send the reply and return
-		if (e.Message.Embeds.Count != 1)
-		{
-			await e.Message.RespondAsync(response.ToString());
-			return;
-		}
-
-		// If fields is null, reply and return
-		if (e.Message.Embeds[0].Fields == null)
-		{
-			response.Append($"And has no fields.\n");
-			await e.Message.RespondAsync(response.ToString());
-			return;
-		}
-
-		// If the first field's name is "Error", add a skull reaction and return
-		if (e.Message.Embeds[0].Fields[0].Name == "Error")
-		{
-			await e.Message.CreateReactionAsync(DiscordEmoji.FromName(client, ":skull:"));
-		}
-
-		// Create a new instance of SongData
-		NoHudDiscordEmbed songData = new();
-
-		// The first embed contains the image URLs
-		foreach (DiscordEmbedField field in e.Message.Embeds[0].Fields)
-		{
-			string name = field.Name;
-			string? value = Program.CleanURL(field.Value);
-
-			if (name == "Ultra:")
-				songData.Ultra = value;
-			else if (name == "Ultra HD:")
-				songData.UltraHD = value;
-			else if (name == "High:")
-				songData.High = value;
-			else if (name == "High HD:")
-				songData.HighHD = value;
-			else if (name == "Mid:")
-				songData.Mid = value;
-			else if (name == "Mid HD:")
-				songData.MidHD = value;
-			else if (name == "Low:")
-				songData.Low = value;
-			else if (name == "Low HD:")
-				songData.LowHD = value;
-			else if (name == "Audio:")
-				songData.Audio = value;
-		}
-
-		// Download the map
-		bool failed = !await DownloadMap(songData, maps.Peek());
-
-		// Pop the map ID if we didn't fail or the fail counter is over 3
-		if (failed)
-		{
-			failCounter++;
-
-			if (failCounter >= 1)
-			{
-				failCounter = 0;
-				maps.Dequeue();
+				string[] videoFiles = Directory.GetFiles(videoCoachPath, "*.webm"); // Or other relevant extensions
+				if (videoFiles.Length > 0)
+					return videoFiles[0]; // Return path to the first found video
 			}
 		}
-		else
-		{
-			failCounter = 0;
-			maps.Dequeue();
-		}
 
-		// If the queue is empty, return
-		if (maps.Count == 0)
-		{
-			Console.WriteLine("We done here!");
-			return;
-		}
-
-		// Copy the command and send it
-		UpdateClipboard();
-		await PasteAndSend();
+		return null;
 	}
 
-	private static async Task PasteAndSend()
+	protected override string GetDiscordCommandForItem(string mapName)
 	{
-		// Press ctrl+v to paste the command
-		SendKeys.SendWait("^v");
-
-		// Wait for .5 seconds
-		await Task.Delay(100);
-
-		// Press enter to send the command
-		SendKeys.SendWait("{ENTER}");
+		return $"/nohud codename:{mapName}";
 	}
 
-	static async Task<bool> DownloadMap(NoHudDiscordEmbed songURLs, string mapName)
+	protected override NoHudDiscordEmbed? ParseEmbedsToData(DiscordMessage message)
 	{
-		// If any of the URLs are null, return false (except for songTitleLogo ofc because it's optional)
-		if (songURLs.UltraHD is null or "undefined")
+		if (message.Embeds.Count == 0)
+			return null;
+		var embedData = new NoHudDiscordEmbed();
+		EmbedParserHelper.ParseFields(embedData, message.Embeds[0].Fields, NoHudFieldMap);
+		return embedData;
+	}
+
+	protected override async Task<bool> ProcessDataItemAsync(NoHudDiscordEmbed songURLs, string mapName)
+	{
+		if (string.IsNullOrWhiteSpace(songURLs.UltraHD) || songURLs.UltraHD.Equals("undefined", StringComparison.OrdinalIgnoreCase))
 		{
-			Console.WriteLine($"Missing URL for {mapName}");
+			Console.WriteLine($"UltraHD URL missing or undefined for '{mapName}'. Cannot download.");
 			return false;
 		}
 
-		Console.WriteLine($"Downloading the video for {mapName}");
+		Console.WriteLine($"Downloading upgraded UltraHD video for '{mapName}'...");
 
-		string? videoPath = GetVideoPath(mapName);
-		if (videoPath is null)
+		// The destination for the new video should be the *cache* path, not the bundle path.
+		string destinationMapFolder = Path.Combine(_cachePath, mapName, "videoscoach"); // Using _cachePath as output for new videos
+		Directory.CreateDirectory(destinationMapFolder);
+
+		// Find the original video path to determine its original filename (if needed for replacement)
+		// Or, if the new video should always be MD5-named or specific-named (e.g. mapName_ULTRA.webm)
+		string? originalVideoPath = GetVideoPathInBundles(mapName);
+		if (originalVideoPath == null)
 		{
-			Console.WriteLine($"Couldn't find the video for {mapName}");
-			return false;
+			Console.WriteLine($"Could not find original video path for {mapName} to replace. Saving with new name.");
+			// Fallback: save as mapName_ULTRAHD.webm or MD5 hash. For now, using MD5.
 		}
 
-		string downloadPath = Path.GetDirectoryName(videoPath)!;
-
-		// Set downloading to true
-		downloading = true;
-
-		// Downloading the cache0 files
-		string md5;
 		try
 		{
-			md5 = await Download.DownloadFileMD5Async(songURLs.UltraHD, downloadPath);
+			// Download the new UltraHD video. It will be named by its MD5 hash.
+			string downloadedFileName = await Download.DownloadFileMD5Async(songURLs.UltraHD, destinationMapFolder);
+
+			// If we need to replace an existing file with a specific name:
+			if (originalVideoPath != null)
+			{
+				string originalFileNameWithExt = Path.GetFileName(originalVideoPath);
+				string finalNewVideoPath = Path.Combine(destinationMapFolder, originalFileNameWithExt); // Target name is same as original
+				string currentNewVideoPath = Path.Combine(destinationMapFolder, downloadedFileName);
+
+				if (File.Exists(finalNewVideoPath))
+					File.Delete(finalNewVideoPath); // Delete old if exists at target location with original name
+				File.Move(currentNewVideoPath, finalNewVideoPath);
+				Console.WriteLine($"Replaced video for '{mapName}' at '{finalNewVideoPath}'.");
+			}
+			else
+			{
+				Console.WriteLine($"Downloaded new video for '{mapName}' as '{downloadedFileName}' in cache.");
+			}
+
+			return true;
 		}
-		catch
+		catch (Exception ex)
 		{
-			Console.WriteLine($"Failed to download {mapName}");
-			downloading = false;
+			Console.WriteLine($"Failed to download or move video for '{mapName}': {ex.Message}");
 			return false;
 		}
+	}
 
-		// Delete the old video
-		File.Delete(videoPath);
+	// Override user command handling if "redo" or "retry" specific to this class are needed.
+	// The base class handles "skip", "stop", "info".
+	protected override async Task HandleUserCommandAsync(MessageCreateEventArgs e)
+	{
+		// Call base handler first for common commands
+		await base.HandleUserCommandAsync(e);
 
-		// Move the new video to the correct location
-		File.Move(Path.Combine(downloadPath, md5), videoPath);
-
-		// Set downloading to false
-		downloading = false;
-
-		// Return true
-		return true;
+		// Add specific commands for UbiArtVidUpgrader if any. Example:
+		string content = e.Message.Content.Trim().ToLowerInvariant();
+		if (content is "redo" or "!redo" or "retry" or "!retry")
+		{
+			if (ItemQueue.Count > 0)
+			{
+				Console.WriteLine($"User requested redo/retry for current item: {ItemQueue.Peek()}");
+				await e.Message.RespondAsync($"Retrying command for `{ItemQueue.Peek()}`.");
+				FailCounterForCurrentItem = 0; // Reset fail counter for this item
+				await SendNextDiscordCommandAsync(); // Resend current command
+			}
+			else
+			{
+				await e.Message.RespondAsync("Queue is empty, nothing to redo.");
+			}
+		}
 	}
 }

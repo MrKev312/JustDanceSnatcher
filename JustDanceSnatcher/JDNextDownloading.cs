@@ -1,387 +1,232 @@
-using DSharpPlus;
-using DSharpPlus.Entities;
-using DSharpPlus.EventArgs;
-
 using JustDanceSnatcher.Helpers;
 using JustDanceSnatcher.UbisoftStuff;
-
-using System.Text;
 using System.Text.Json;
+using DSharpPlus.Entities;
 
 namespace JustDanceSnatcher;
 
-internal class JDNextDownloading
+// Note: This class is no longer static. Instantiate it to use.
+internal class JDNextDownloader : DiscordAssetDownloaderBase<KeyValuePair<string, JDNextDatabaseEntry>, JDNextDiscordEmbed>
 {
-	// Queue of map IDs
-	static readonly Queue<KeyValuePair<string, JDNextDatabaseEntry>> mapIds = [];
-	static Dictionary<string, JDNextDatabaseEntry> jDCacheJSON = [];
-	static Dictionary<string, string> jdBundleTag = [];
-	static string output = string.Empty;
-	static uint failCounter = 0;
+	private Dictionary<string, JDNextDatabaseEntry> _jDCacheJson = [];
+	private Dictionary<string, string> _jdBundleTags = []; // Stores songpack tags for redownloaded official maps
 
-	static readonly JsonSerializerOptions options = new() 
+	// Mappings for EmbedParserHelper
+	private static readonly IReadOnlyDictionary<string, string> ImageUrlFieldMap = new Dictionary<string, string>
 	{
-		WriteIndented = true,
-		Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+		{"coachesSmall:", nameof(ImageURLs.coachesSmall)}, {"coachesLarge:", nameof(ImageURLs.coachesLarge)},
+		{"Cover:", nameof(ImageURLs.Cover)}, {"Cover1024:", nameof(ImageURLs.Cover1024)},
+		{"CoverSmall:", nameof(ImageURLs.CoverSmall)}, {"Song Title Logo:", nameof(ImageURLs.SongTitleLogo)}
+	};
+	private static readonly IReadOnlyDictionary<string, string> PreviewUrlFieldMap = new Dictionary<string, string>
+	{
+		{"audioPreview.opus:", nameof(PreviewURLs.audioPreview)}, {"HIGH.vp8.webm:", nameof(PreviewURLs.HIGHvp8)},
+		{"HIGH.vp9.webm:", nameof(PreviewURLs.HIGHvp9)}, {"LOW.vp8.webm:", nameof(PreviewURLs.LOWvp8)},
+		{"LOW.vp9.webm:", nameof(PreviewURLs.LOWvp9)}, {"MID.vp8.webm:", nameof(PreviewURLs.MIDvp8)},
+		{"MID.vp9.webm:", nameof(PreviewURLs.MIDvp9)}, {"ULTRA.vp8.webm:", nameof(PreviewURLs.ULTRAvp8)},
+		{"ULTRA.vp9.webm:", nameof(PreviewURLs.ULTRAvp9)}
+	};
+	private static readonly IReadOnlyDictionary<string, string> ContentUrlFieldMap = new Dictionary<string, string>
+	{
+		{"Ultra HD:", nameof(ContentURLs.UltraHD)}, {"Ultra VP9:", nameof(ContentURLs.Ultravp9)},
+		{"High HD:", nameof(ContentURLs.HighHD)}, {"High VP9:", nameof(ContentURLs.Highvp9)},
+		{"Mid HD:", nameof(ContentURLs.MidHD)}, {"Mid VP9:", nameof(ContentURLs.Midvp9)},
+		{"Low HD:", nameof(ContentURLs.LowHD)}, {"Low VP9:", nameof(ContentURLs.Lowvp9)},
+		{"Audio:", nameof(ContentURLs.Audio)}, {"mapPackage:", nameof(ContentURLs.mapPackage)}
 	};
 
-	public static async Task Run()
+	protected override string BotToken => File.ReadAllText("Secret.txt").Trim();
+	protected override int ExpectedEmbedCount => 3; // JDNext bot sends 3 embeds for assets
+
+	protected override async Task InitializeAsync()
 	{
 		Console.Clear();
-		// Ask for the path to the cache.json file
-		string path = Question.AskFile("Enter the path to the jnext database json file: ", true, true);
-		output = Question.AskFolder("Enter the path to your maps folder: ", true);
+		string dbPath = Question.AskFile("Enter the path or URL to the jnext database json file: ", true, true);
+		OutputDirectory = Question.AskFolder("Enter the path to your maps folder: ", true);
 
-		// If the path starts with http, get content as string
-		string json = string.Empty;
-		if (path.StartsWith("http"))
+		string jsonContent;
+		if (dbPath.StartsWith("http", StringComparison.OrdinalIgnoreCase))
 		{
 			using HttpClient client = new();
-			json = await client.GetStringAsync(path);
+			jsonContent = await client.GetStringAsync(dbPath);
 		}
 		else
 		{
-			json = File.ReadAllText(path);
+			jsonContent = File.ReadAllText(dbPath);
 		}
 
-		jDCacheJSON = JsonSerializer.Deserialize<Dictionary<string, JDNextDatabaseEntry>>(json)!;
+		_jDCacheJson = JsonSerializer.Deserialize<Dictionary<string, JDNextDatabaseEntry>>(jsonContent, Program.jsonOptions) ?? [];
 
-		// If we have a pre-existing cache, load it and remove all the mapIDs that are already in the cache
 		HandlePreExistingCache();
 
-		// Now we have a list of all the mapIDs that are missing
-		Console.WriteLine($"We have to download {jDCacheJSON.Count} songs!");
-
-		// Add all the missing mapIDs to the queue
-		foreach (KeyValuePair<string, JDNextDatabaseEntry> entry in jDCacheJSON)
-			mapIds.Enqueue(entry);
-
-		// Create a new DiscordClientBuilder
-		Console.WriteLine("Starting discord bot!");
-
-		string token = File.ReadAllText("Secret.txt").Trim();
-
-		DiscordClient discord = new DiscordClient(new DiscordConfiguration()
+		Console.WriteLine($"Found {_jDCacheJson.Count} songs to download.");
+		foreach (var entry in _jDCacheJson)
 		{
-			Token = token,
-			TokenType = TokenType.Bot,
-			Intents = DiscordIntents.MessageContents | DiscordIntents.AllUnprivileged
-		});
-
-		// Add the message created event
-		discord.MessageCreated += OnMessageCreated;
-
-		// Connect to Discord
-		await discord.ConnectAsync();
-
-		Console.WriteLine($"Downloading {mapIds.Count} map ids");
-
-		// Set the clipboard to the first map ID
-		if (mapIds.Count != 0)
-			Program.SetClipboard($"/assets server:jdnext codename:{mapIds.Peek().Value.parentMapName}");
-		else
-			return;
-
-		// Wait for the bot to disconnect
-		await Task.Delay(-1);
+			ItemQueue.Enqueue(entry);
+		}
 	}
 
-	static void HandlePreExistingCache()
+	private void HandlePreExistingCache()
 	{
-		// Each folder in the output directory is a map codename
-		string[] alreadyDownloaded = Directory.GetDirectories(output).Select(x => Path.GetFileName(x)).ToArray();
+		string[] alreadyDownloadedFolders = Directory.Exists(OutputDirectory)
+			? [.. Directory.GetDirectories(OutputDirectory).Select(s => Path.GetFileName(s)!)]
+			: [];
 
-		// Remove any where parentMapName is in the names array
-		jDCacheJSON = jDCacheJSON.Where(x =>
+		_jDCacheJson = _jDCacheJson.Where(kvp =>
 		{
-			if (!alreadyDownloaded.Contains(x.Value.parentMapName))
-				return true;
+			JDNextDatabaseEntry dbEntry = kvp.Value;
+			if (!alreadyDownloadedFolders.Contains(dbEntry.parentMapName))
+				return true; // Not downloaded yet
 
-			// Parse its SongInfo.json file
-			string json = File.ReadAllText(Path.Combine(output, x.Value.parentMapName, "SongInfo.json"));
-			JDNextDatabaseEntry entry = JsonSerializer.Deserialize<JDNextDatabaseEntry>(json, options)!;
-
-			// If it has a custom tag, delete the folder and return true
-			if (entry.tags.Contains("Custom"))
+			string songInfoPath = Path.Combine(OutputDirectory, dbEntry.parentMapName, "SongInfo.json");
+			if (!File.Exists(songInfoPath))
 			{
-				Console.WriteLine($"Redownloading {x.Value.parentMapName} as it's now official");
+				Console.WriteLine($"SongInfo.json missing for {dbEntry.parentMapName}, marking for redownload.");
+				return true; // Corrupted download, redownload
+			}
 
-				// If any of the tags starts with songpack, store it in the jdBundleTag dictionary
-				foreach (string tag in entry.tags)
+			try
+			{
+				string songInfoJson = File.ReadAllText(songInfoPath);
+				JDNextDatabaseEntry existingEntry = JsonSerializer.Deserialize<JDNextDatabaseEntry>(songInfoJson, Program.jsonOptions)!;
+
+				if (existingEntry.tags.Contains("Custom")) // If previously marked as custom
 				{
-					if (tag.StartsWith("songpack"))
-						jdBundleTag[x.Value.parentMapName] = tag;
-				}
+					// Check if the new DB entry still has "Custom" or if it became official
+					bool isNowOfficial = !dbEntry.tags.Contains("Custom");
+					// Or based on some other logic, for now, assume if the new entry is NOT custom, it's "official"
+					// This logic might need to be more robust based on actual database flags.
 
-				Directory.Delete(Path.Combine(output, x.Value.parentMapName), true);
+					if (isNowOfficial) // For simplicity, if the new DB entry does NOT have "Custom", assume it's official
+					{
+						Console.WriteLine($"'{dbEntry.parentMapName}' was custom, now official. Marking for redownload.");
+						// Store songpack tags if any, to re-add them later
+						foreach (string tag in existingEntry.tags.Where(t => t.StartsWith("songpack")))
+						{
+							_jdBundleTags[dbEntry.parentMapName] = tag;
+						}
+
+						Directory.Delete(Path.Combine(OutputDirectory, dbEntry.parentMapName), true);
+						return true;
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error reading SongInfo.json for {dbEntry.parentMapName}: {ex.Message}. Marking for redownload.");
+				Directory.Delete(Path.Combine(OutputDirectory, dbEntry.parentMapName), true); // Clean up potentially corrupt folder
 				return true;
 			}
 
-			Console.WriteLine($"Removing {x.Value.parentMapName} from the list of songs to download");
-			return false;
-		}).ToDictionary(x => x.Key, x => x.Value);
+			Console.WriteLine($"'{dbEntry.parentMapName}' already downloaded and up-to-date. Skipping.");
+			return false; // Already downloaded and not needing update based on "Custom" tag logic
+		}).ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
 	}
 
-	public static async Task OnMessageCreated(DiscordClient client, MessageCreateEventArgs e)
+	protected override string GetDiscordCommandForItem(KeyValuePair<string, JDNextDatabaseEntry> item)
 	{
-		ArgumentNullException.ThrowIfNull(client);
-
-		ArgumentNullException.ThrowIfNull(e);
-
-		// If the message is from ourselves, ignore it
-		if (e.Author.IsCurrent)
-			return;
-
-		// If the author is not a bot, ignore it
-		if (!e.Author.IsBot)
-		{
-			// If the message content is "skip", pop the first map ID and copy the command to the clipboard
-			if (e.Message.Content.Equals("skip", StringComparison.CurrentCultureIgnoreCase))
-			{
-				mapIds.Dequeue();
-				Program.SetClipboard($"/assets server:jdnext codename:{mapIds.Peek().Value.parentMapName}");
-				return;
-			}
-			else if (e.Message.Content.Equals("stop", StringComparison.CurrentCultureIgnoreCase))
-			{
-				Console.WriteLine("We stopping bois!");
-				await e.Message.RespondAsync("Aight, we stoppin");
-
-				// Disconnect the bot
-				await client.DisconnectAsync();
-				Environment.Exit(0);
-			}
-			else if (e.Message.Content.Equals("info", StringComparison.CurrentCultureIgnoreCase))
-			{
-				// If we have no map IDs left, return
-				if (mapIds.Count != 0)
-					// Say which song we're currently on and how many are left
-					await e.Message.RespondAsync($"Currently on {mapIds.Peek().Value.parentMapName}. {mapIds.Count} songs left.");
-				else
-					// Say that we're done
-					await e.Message.RespondAsync("We're done here!");
-				return;
-			}
-
-			// If the message content is not "skip" or "stop", ignore it
-			return;
-		}
-
-		// Add a checkmark reaction to the message
-		await e.Message.CreateReactionAsync(DiscordEmoji.FromName(client, ":white_check_mark:"));
-
-		// If there's no embeds, wait for 1 second and recount the embeds up to a max of 10 times
-		for (int i = 0; i < 10 && e.Message.Embeds.Count == 0; i++)
-			await Task.Delay(1000);
-
-		StringBuilder response = new();
-
-		response.Append($"Message from {e.Author.Username}#{e.Author.Discriminator} in {e.Channel.Name}:\n");
-		response.Append($"This message has {e.Message.Embeds.Count} embeds.\n");
-
-		// If the message does not have 3 embeds, send the reply and return
-		if (e.Message.Embeds.Count != 3)
-		{
-			await e.Message.RespondAsync(response.ToString());
-			return;
-		}
-
-		// Create a new instance of SongData
-		JDNextDiscordEmbed songData = new();
-
-		// The first embed contains the image URLs
-		foreach (DiscordEmbedField field in e.Message.Embeds[0].Fields)
-		{
-			string name = field.Name;
-			string? value = Program.CleanURL(field.Value);
-
-			if (name == "coachesSmall:")
-				songData.ImageURLs.coachesSmall = value;
-			else if (name == "coachesLarge:")
-				songData.ImageURLs.coachesLarge = value;
-			else if (name == "Cover:")
-				songData.ImageURLs.Cover = value;
-			else if (name == "Cover1024:")
-				songData.ImageURLs.Cover1024 = value;
-			else if (name == "CoverSmall:")
-				songData.ImageURLs.CoverSmall = value;
-			else if (name == "Song Title Logo:")
-				songData.ImageURLs.SongTitleLogo = value;
-		}
-
-		// The second embed contains the preview URLs
-		foreach (DiscordEmbedField field in e.Message.Embeds[1].Fields)
-		{
-			string name = field.Name;
-			string? value = Program.CleanURL(field.Value);
-
-			if (name == "audioPreview.opus:")
-				songData.PreviewURLs.audioPreview = value;
-			else if (name == "HIGH.vp8.webm:")
-				songData.PreviewURLs.HIGHvp8 = value;
-			else if (name == "HIGH.vp9.webm:")
-				songData.PreviewURLs.HIGHvp9 = value;
-			else if (name == "LOW.vp8.webm:")
-				songData.PreviewURLs.LOWvp8 = value;
-			else if (name == "LOW.vp9.webm:")
-				songData.PreviewURLs.LOWvp9 = value;
-			else if (name == "MID.vp8.webm:")
-				songData.PreviewURLs.MIDvp8 = value;
-			else if (name == "MID.vp9.webm:")
-				songData.PreviewURLs.MIDvp9 = value;
-			else if (name == "ULTRA.vp8.webm:")
-				songData.PreviewURLs.ULTRAvp8 = value;
-			else if (name == "ULTRA.vp9.webm:")
-				songData.PreviewURLs.ULTRAvp9 = value;
-		}
-
-		// The third embed contains the content URLs
-		foreach (DiscordEmbedField field in e.Message.Embeds[2].Fields)
-		{
-			string name = field.Name;
-			string? value = Program.CleanURL(field.Value);
-
-			if (name == "Ultra HD:")
-				songData.ContentURLs.UltraHD = value;
-			else if (name == "Ultra VP9:")
-				songData.ContentURLs.Ultravp9 = value;
-			else if (name == "High HD:")
-				songData.ContentURLs.HighHD = value;
-			else if (name == "High VP9:")
-				songData.ContentURLs.Highvp9 = value;
-			else if (name == "Mid HD:")
-				songData.ContentURLs.MidHD = value;
-			else if (name == "Mid VP9:")
-				songData.ContentURLs.Midvp9 = value;
-			else if (name == "Low HD:")
-				songData.ContentURLs.LowHD = value;
-			else if (name == "Low VP9:")
-				songData.ContentURLs.Lowvp9 = value;
-			else if (name == "Audio:")
-				songData.ContentURLs.Audio = value;
-			else if (name == "mapPackage:")
-				songData.ContentURLs.mapPackage = value;
-		}
-
-		// Download the map
-		bool failed = !await DownloadMap(songData, mapIds.Peek());
-		if (failed)
-			// If the download failed, increment the fail counter
-			failCounter++;
-
-		// Pop the map ID if we didn't fail or the fail counter is over 10
-		if (!failed || failCounter > 10)
-		{
-			mapIds.Dequeue();
-			failCounter = 0;
-		}
-
-		// If the queue is empty, return
-		if (mapIds.Count == 0)
-		{
-			Console.WriteLine("We done here!");
-			return;
-		}
-
-		// Copy the command to the clipboard
-		Program.SetClipboard($"/assets server:jdnext codename:{mapIds.Peek().Value.parentMapName}");
-
-		// Press ctrl+v to paste the command
-		SendKeys.SendWait("^v");
-
-		// Wait for .5 seconds
-		await Task.Delay(100);
-
-		// Press enter to send the command
-		SendKeys.SendWait("{ENTER}");
+		return $"/assets server:jdnext codename:{item.Value.parentMapName}";
 	}
 
-	static void AddMissingTitles()
+	protected override JDNextDiscordEmbed? ParseEmbedsToData(DiscordMessage message)
 	{
-		//// First we grab all entries where the title is missing and the title cover is present in the database
-		//List<JDSong> songs;
-		//// For each song, we download the titlecover and add it to the cache
-		//Parallel.ForEach(songs, AddMissingTitle);
-	}
-
-	static void AddMissingTitle(string songID)
-	{
-		// The database entry for the song
-		JDNextDatabaseEntry entry = jDCacheJSON.Values.AsParallel().Where(x => x.parentMapName == songID).First();
-
-		// The path to the title cover
-		string path = Path.Combine(output, songID, "songTitleLogo");
-
-		// Download the title cover and get the MD5 hash
-		string md5 = Download.DownloadFileMD5(entry.assets.songTitleLogo!, path);
-	}
-
-	static async Task<bool> DownloadMap(JDNextDiscordEmbed songURLs, KeyValuePair<string, JDNextDatabaseEntry> songInfo)
-	{
-		string mapName = songInfo.Value.parentMapName;
-		// If any of the URLs are null, return false (except for songTitleLogo ofc because it's optional)
-		if (songURLs.ContentURLs.Audio is null ||
-			songURLs.ContentURLs.mapPackage is null ||
-			songURLs.ContentURLs.UltraHD is null ||
-			songURLs.ContentURLs.Highvp9 is null ||
-			songURLs.ContentURLs.Midvp9 is null ||
-			songURLs.ContentURLs.Lowvp9 is null ||
-			songURLs.ImageURLs.Cover is null ||
-			songURLs.ImageURLs.coachesLarge is null ||
-			songURLs.ImageURLs.coachesSmall is null ||
-			songInfo.Value.assets is null)
+		if (message.Embeds.Count < 3)
 		{
-			Console.WriteLine($"Missing URLs for {mapName}");
+			Console.WriteLine($"Error: Expected 3 embeds for JDNext assets, got {message.Embeds.Count}.");
+			return null;
+		}
+
+		var songData = new JDNextDiscordEmbed();
+		EmbedParserHelper.ParseFields(songData.ImageURLs, message.Embeds[0].Fields, ImageUrlFieldMap);
+		EmbedParserHelper.ParseFields(songData.PreviewURLs, message.Embeds[1].Fields, PreviewUrlFieldMap);
+		EmbedParserHelper.ParseFields(songData.ContentURLs, message.Embeds[2].Fields, ContentUrlFieldMap);
+		return songData;
+	}
+
+	protected override async Task<bool> ProcessDataItemAsync(JDNextDiscordEmbed songURLs, KeyValuePair<string, JDNextDatabaseEntry> songInfoPair)
+	{
+		JDNextDatabaseEntry songInfo = songInfoPair.Value;
+		string mapName = songInfo.parentMapName;
+
+		// Validate essential URLs
+		if (songURLs.ContentURLs.Audio == null || songURLs.ContentURLs.mapPackage == null ||
+			songURLs.ContentURLs.UltraHD == null || songURLs.ContentURLs.Highvp9 == null || // Assuming HighVP9 is a key quality
+			songURLs.ImageURLs.Cover == null || songURLs.ImageURLs.coachesLarge == null || songURLs.ImageURLs.coachesSmall == null ||
+			songInfo.assets == null) // songInfo.assets contains URLs from the database, not discord.
+		{
+			Console.WriteLine($"Critical URLs missing for '{mapName}'. Download cannot proceed.");
 			return false;
 		}
 
-		Console.WriteLine($"Downloading the map {mapName}");
+		Console.WriteLine($"Downloading assets for '{mapName}'...");
+		string mapPath = Path.Combine(OutputDirectory, mapName);
+		Directory.CreateDirectory(mapPath); // Ensure base map directory exists
 
-		// Output path
-		string path = Path.Combine(output, mapName);
+		List<Task<string>> downloadTasks = new();
 
-		List<Task<string>> tasks =
-		[
-			// Downloading the preview files
-			Download.DownloadFileMD5Async(songInfo.Value.assets.audioPreviewopus, Path.Combine(path, "AudioPreview_opus")),
-			Download.DownloadFileMD5Async(songInfo.Value.assets.videoPreview_ULTRAvp9webm, Path.Combine(path, "videoPreview"), "ULTRA"),
-			Download.DownloadFileMD5Async(songInfo.Value.assets.videoPreview_HIGHvp9webm, Path.Combine(path, "videoPreview"), "HIGH"),
-			Download.DownloadFileMD5Async(songInfo.Value.assets.videoPreview_MIDvp9webm, Path.Combine(path, "videoPreview"), "MID"),
-			Download.DownloadFileMD5Async(songInfo.Value.assets.videoPreview_LOWvp9webm, Path.Combine(path, "videoPreview"), "LOW"),
+		// Preview files (URLs from database 'songInfo.assets')
+		if (songInfo.assets.audioPreviewopus != null)
+			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.audioPreviewopus, Path.Combine(mapPath, "AudioPreview_opus")));
+		if (songInfo.assets.videoPreview_ULTRAvp9webm != null)
+			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.videoPreview_ULTRAvp9webm, Path.Combine(mapPath, "videoPreview"), "ULTRA"));
+		if (songInfo.assets.videoPreview_HIGHvp9webm != null)
+			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.videoPreview_HIGHvp9webm, Path.Combine(mapPath, "videoPreview"), "HIGH"));
+		// Add MID and LOW previews if they are consistently available and needed
+		if (songInfo.assets.videoPreview_MIDvp9webm != null)
+			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.videoPreview_MIDvp9webm, Path.Combine(mapPath, "videoPreview"), "MID"));
+		if (songInfo.assets.videoPreview_LOWvp9webm != null)
+			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.videoPreview_LOWvp9webm, Path.Combine(mapPath, "videoPreview"), "LOW"));
 
-			// Downloading the image files
-			Download.DownloadFileMD5Async(songURLs.ImageURLs.Cover!, Path.Combine(path, "Cover")),
-			Download.DownloadFileMD5Async(songURLs.ImageURLs.coachesLarge!, Path.Combine(path, "CoachesLarge")),
-			Download.DownloadFileMD5Async(songURLs.ImageURLs.coachesSmall!, Path.Combine(path, "CoachesSmall")),
+		// Image files (URLs from Discord 'songURLs.ImageURLs')
+		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ImageURLs.Cover, Path.Combine(mapPath, "Cover")));
+		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ImageURLs.coachesLarge, Path.Combine(mapPath, "CoachesLarge")));
+		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ImageURLs.coachesSmall, Path.Combine(mapPath, "CoachesSmall")));
 
-			// Downloading the content files
-			Download.DownloadFileMD5Async(songURLs.ContentURLs.Audio!, Path.Combine(path, "Audio_opus")),
-			Download.DownloadFileMD5Async(songURLs.ContentURLs.UltraHD!, Path.Combine(path, "video"), "ULTRA"),
-			Download.DownloadFileMD5Async(songURLs.ContentURLs.Highvp9!, Path.Combine(path, "video"), "HIGH"),
-			Download.DownloadFileMD5Async(songURLs.ContentURLs.Midvp9!, Path.Combine(path, "video"), "MID"),
-			Download.DownloadFileMD5Async(songURLs.ContentURLs.Lowvp9!, Path.Combine(path, "video"), "LOW"),
-			Download.DownloadFileMD5Async(songURLs.ContentURLs.mapPackage!, Path.Combine(path, "MapPackage"))
-		];
-
-		if (songInfo.Value.hasSongTitleInCover)
+		// Song Title Logo (from database 'songInfo.assets' if present)
+		if (songInfo.hasSongTitleInCover && songInfo.assets.songTitleLogo != null)
 		{
-			tasks.Add(Download.DownloadFileMD5Async(songInfo.Value.assets.songTitleLogo!, Path.Combine(path, "songTitleLogo"))!);
+			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.songTitleLogo, Path.Combine(mapPath, "songTitleLogo")));
 		}
 
-		// Wait for all downloads to complete
-		await Task.WhenAll(tasks);
+		// Content files (URLs from Discord 'songURLs.ContentURLs')
+		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.Audio, Path.Combine(mapPath, "Audio_opus")));
+		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.UltraHD, Path.Combine(mapPath, "video"), "ULTRA"));
+		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.Highvp9, Path.Combine(mapPath, "video"), "HIGH"));
+		// Add MID and LOW main videos if available and needed
+		if (songURLs.ContentURLs.Midvp9 != null)
+			downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.Midvp9, Path.Combine(mapPath, "video"), "MID"));
+		if (songURLs.ContentURLs.Lowvp9 != null)
+			downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.Lowvp9, Path.Combine(mapPath, "video"), "LOW"));
 
-		// Now we add the SongInfo.json file
-		songInfo.Value.songID = songInfo.Key;
+		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.mapPackage, Path.Combine(mapPath, "MapPackage")));
 
-		// If the song has a songpack tag, add it to the tags
-		if (jdBundleTag.ContainsKey(mapName))
-			songInfo.Value.tags.Add(jdBundleTag[mapName]);
+		try
+		{
+			await Task.WhenAll(downloadTasks);
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"One or more downloads failed for '{mapName}': {ex.Message}");
+			// Consider cleanup of partially downloaded files if necessary
+			return false;
+		}
 
-		string json = JsonSerializer.Serialize(songInfo.Value, options);
-		File.WriteAllText(Path.Combine(path, "SongInfo.json"), json);
+		// Create SongInfo.json
+		songInfo.songID = songInfoPair.Key; // Ensure songID is set from the database key
+		if (_jdBundleTags.TryGetValue(mapName, out string? bundleTag))
+		{
+			if (!songInfo.tags.Contains(bundleTag))
+				songInfo.tags.Add(bundleTag);
+		}
 
-		// Return true
+		string songInfoJson = JsonSerializer.Serialize(songInfo, Program.jsonOptions);
+		File.WriteAllText(Path.Combine(mapPath, "SongInfo.json"), songInfoJson);
+
+		Console.WriteLine($"Successfully downloaded and prepared '{mapName}'.");
 		return true;
 	}
+
+	// Commented out methods AddMissingTitles and AddMissingTitle can be re-implemented if needed.
+	// static void AddMissingTitles() { /* ... */ }
+	// static void AddMissingTitle(string songID) { /* ... */ }
 }

@@ -1,4 +1,5 @@
 ﻿namespace JustDanceSnatcher;
+
 internal class NoHudDiscordEmbed
 {
 	public string? Ultra { get; set; }

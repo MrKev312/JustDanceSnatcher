@@ -5,386 +5,273 @@ using DSharpPlus.EventArgs;
 using JustDanceSnatcher.Helpers;
 using JustDanceSnatcher.UbisoftStuff;
 
-using System.Text;
+using System.IO;
 using System.Text.Json;
 
 namespace JustDanceSnatcher;
 
-enum State
+internal enum ServerUpgradeStep
 {
-	Preview,
-	Main
+	RequestPreview, // For /assets server:jdu
+	RequestMain // For /nohud
 }
 
-internal class ServerVidUpgrader
+// Note: This class is no longer static. Instantiate it to use.
+internal class ServerVidUpgrader : DiscordAssetDownloaderBase<JDNextDatabaseEntry, JDNextDiscordEmbed>
 {
-	// Queue of map IDs
-	static readonly Queue<JDNextDatabaseEntry> mapIds = [];
-	static string input = string.Empty;
-	static uint failCounter = 0;
+	private ServerUpgradeStep _currentStep = ServerUpgradeStep.RequestPreview;
+	private JDNextDiscordEmbed _accumulatedSongData = new(); // To store data across steps
 
-	static State state = State.Preview;
-	static JDNextDiscordEmbed currentSongData = new();
-
-	static DiscordClient? discord;
-
-	static readonly JsonSerializerOptions options = new() 
+	// Mappings for EmbedParserHelper
+	private static readonly IReadOnlyDictionary<string, string> PreviewUrlFieldMap = new Dictionary<string, string>
 	{
-		WriteIndented = true,
-		Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
+		{"Audio:", nameof(PreviewURLs.audioPreview)}, // Note: JDU /assets uses "Audio:" for audioPreview
+        {"HIGH (vp9)", nameof(PreviewURLs.HIGHvp9)},
+		{"LOW (vp9)", nameof(PreviewURLs.LOWvp9)},
+		{"MID (vp9)", nameof(PreviewURLs.MIDvp9)},
+		{"ULTRA (vp9)", nameof(PreviewURLs.ULTRAvp9)}
 	};
 
-	public static async Task Run()
+	private static readonly IReadOnlyDictionary<string, string> MainContentUrlFieldMap = new Dictionary<string, string>
+	{
+		{"Ultra HD:", nameof(ContentURLs.UltraHD)},
+		{"High HD:", nameof(ContentURLs.HighHD)},
+		{"Mid HD:", nameof(ContentURLs.MidHD)},
+		{"Low HD:", nameof(ContentURLs.LowHD)}
+	};
+
+	protected override string BotToken => File.ReadAllText("Secret.txt").Trim();
+	// ExpectedEmbedCount varies by step, so override IsErrorEmbed or ParseEmbedsToData to handle
+	protected override int ExpectedEmbedCount => 0; // Set to 0 to allow custom handling in ParseEmbedsToData
+
+	protected override async Task InitializeAsync()
 	{
 		Console.Clear();
-		// Ask for the path to the cache.json file
-		input = Question.AskFolder("Enter the path to your maps folder: ", true);
+		OutputDirectory = Question.AskFolder("Enter the path to your maps folder (this is where videos will be upgraded): ", true);
 
-		// Add every map ID to the queue
-		string[] folders = Directory.GetDirectories(input);
-		for (int i = 0; i < folders.Length; i++)
+		string[] mapFolders = Directory.GetDirectories(OutputDirectory);
+		foreach (string folder in mapFolders)
 		{
-			string folder = folders[i];
-			// In the folder, load the SongInfo.json file
-			string json = File.ReadAllText(Path.Combine(folder, "SongInfo.json"));
-			JDNextDatabaseEntry entry = JsonSerializer.Deserialize<JDNextDatabaseEntry>(json, options)!;
+			string songInfoPath = Path.Combine(folder, "SongInfo.json");
+			if (!File.Exists(songInfoPath))
+				continue;
 
-			// If the folder name doesn't match the parent map name, rename the folder
-			if (Path.GetFileName(folder) != entry.parentMapName)
+			try
 			{
-				Directory.Move(folder, Path.Combine(input, entry.parentMapName));
-				folder = Path.Combine(input, entry.parentMapName);
-			}
+				string json = File.ReadAllText(songInfoPath);
+				JDNextDatabaseEntry entry = JsonSerializer.Deserialize<JDNextDatabaseEntry>(json, Program.jsonOptions)!;
 
-			// If there's one video file in the video folder, add the map ID to the queue
-			if (Directory.GetFiles(Path.Combine(folder, "video")).Length <= 1 || Directory.GetFiles(Path.Combine(folder, "videoPreview")).Length <= 1)
+				// Rename folder if it doesn't match parentMapName (as in original logic)
+				string expectedFolderName = entry.parentMapName;
+				string currentFolderName = Path.GetFileName(folder);
+				string correctedFolderPath = folder;
+
+				if (!string.Equals(currentFolderName, expectedFolderName, StringComparison.OrdinalIgnoreCase))
+				{
+					string targetPath = Path.Combine(Path.GetDirectoryName(folder)!, expectedFolderName);
+					if (!Directory.Exists(targetPath)) // Avoid conflict if target already exists somehow
+					{
+						Directory.Move(folder, targetPath);
+						correctedFolderPath = targetPath;
+						Console.WriteLine($"Renamed folder '{currentFolderName}' to '{expectedFolderName}'.");
+					}
+					else
+					{
+						Console.WriteLine($"Warning: Could not rename '{currentFolderName}' to '{expectedFolderName}' as target already exists. Using original path.");
+					}
+				}
+
+				bool needsUpgrade = false;
+				string videoPath = Path.Combine(correctedFolderPath, "video");
+				string videoPreviewPath = Path.Combine(correctedFolderPath, "videoPreview");
+
+				if (Directory.Exists(videoPath) && Directory.GetFiles(videoPath).Length <= 1)
+					needsUpgrade = true;
+				if (Directory.Exists(videoPreviewPath) && Directory.GetFiles(videoPreviewPath).Length <= 1)
+					needsUpgrade = true;
+
+				// Original logic also checked for UNKNOWN.webm, but stated deprecated
+				// if (File.Exists(Path.Combine(videoPath, "UNKNOWN.webm"))) needsUpgrade = true;
+
+				if (needsUpgrade)
+				{
+					Console.WriteLine($"Adding '{entry.parentMapName}' to the upgrade queue.");
+					ItemQueue.Enqueue(entry);
+				}
+			}
+			catch (Exception ex)
 			{
-				Console.WriteLine($"Adding {entry.parentMapName} to the queue");
-				mapIds.Enqueue(entry);
+				Console.WriteLine($"Error processing folder '{folder}': {ex.Message}. Skipping.");
 			}
-
-			// Deprecated since we're now using hashes as filenames
-			//// Only if there's an UNKNOWN.webm file in the video folder
-			//if (File.Exists(Path.Combine(folder, "video", "UNKNOWN.webm")))
-			//{
-			//	Console.WriteLine($"Adding {entry.parentMapName} to the queue");
-			//	mapIds.Enqueue(entry);
-			//}
 		}
 
-		// Create a new DiscordClientBuilder
-		Console.WriteLine("Starting discord bot!");
-
-		string token = File.ReadAllText("Secret.txt").Trim();
-
-		discord = new(new DiscordConfiguration()
-		{
-			Token = token,
-			TokenType = TokenType.Bot,
-			Intents = DiscordIntents.MessageContents | DiscordIntents.AllUnprivileged
-		});
-
-		// Add the message created event
-		discord.MessageCreated += OnMessageCreated;
-
-		// Connect to Discord
-		await discord.ConnectAsync();
-
-		Console.WriteLine($"Downloading {mapIds.Count} map ids");
-
-		// Set the clipboard to the first map ID
-		if (mapIds.Count != 0)
-			SetClipboard();
-		else
-			return;
-
-		// Wait for the bot to disconnect
-		await Task.Delay(-1);
+		await Task.CompletedTask; // No async operations in this Initialize
 	}
 
-	static void SetClipboard()
+	protected override string GetDiscordCommandForItem(JDNextDatabaseEntry item)
 	{
-		if (mapIds.Count == 0)
-			throw new InvalidOperationException("No map IDs left!");
-
-		string codename = mapIds.Peek().parentMapName;
-
-		string command;
-
-		if (state == State.Preview)
-			//Program.SetClipboard($"/assets server:jdu codename:{codename}");
-			command = $"/assets server:jdu codename:{codename}";
-		else
-			//Program.SetClipboard($"/nohud codename:{codename}");
-			command = $"/nohud codename:{codename}";
-
-		// Set the clipboard to the command
-		Program.SetClipboard(command);
+		return _currentStep == ServerUpgradeStep.RequestPreview
+			? $"/assets server:jdu codename:{item.parentMapName}"
+			: $"/nohud codename:{item.parentMapName}";
 	}
 
-	static async Task OnMessageCreated(DiscordClient client, MessageCreateEventArgs e)
+	// This downloader has a two-step process per item.
+	// We override the message handling part of the base to manage state.
+	// The base OnDiscordMessageCreatedAsync is not used directly. We call its helpers.
+	// This means the base method's HandleUserCommandAsync will also need to be explicitly called.
+	protected async Task OnDiscordMessageCreatedAsync(DiscordClient sender, MessageCreateEventArgs e)
 	{
-		ArgumentNullException.ThrowIfNull(client);
-
-		ArgumentNullException.ThrowIfNull(e);
-
-		// If the message is from ourselves, ignore it
-		if (e.Author.IsCurrent)
-			return;
-
-		// If the author is not a bot, ignore it
-		if (!e.Author.IsBot)
+		if (e.Author.IsCurrent || !e.Author.IsBot)
 		{
-			// If the message content is "skip", pop the first map ID and copy the command to the clipboard
-			if (e.Message.Content.Equals("skip", StringComparison.CurrentCultureIgnoreCase))
-			{
-				mapIds.Dequeue();
-
-				// Respond with the new map ID
-				await e.Message.RespondAsync($"Skipping to {mapIds.Peek().parentMapName}");
-
-				state = State.Preview;
-				SetClipboard();
-				return;
-			}
-			else if (e.Message.Content.Equals("stop", StringComparison.CurrentCultureIgnoreCase))
-			{
-				Console.WriteLine("We stopping bois!");
-				await e.Message.RespondAsync("Aight, we stoppin");
-
-				// Disconnect the bot
-				await client.DisconnectAsync();
-				Environment.Exit(0);
-			}
-			else if (e.Message.Content.Equals("info", StringComparison.CurrentCultureIgnoreCase))
-			{
-				// If we have no map IDs left, return
-				if (mapIds.Count != 0)
-					// Say which song we're currently on and how many are left
-					await e.Message.RespondAsync($"Currently on {mapIds.Peek().parentMapName}. {mapIds.Count} songs left.");
-				else
-					// Say that we're done
-					await e.Message.RespondAsync("We're done here!");
-				return;
-			}
-
-			// If the message content is not "skip" or "stop", ignore it
+			await HandleUserCommandAsync(e); // Use base class's user command handler
 			return;
 		}
 
-		// Add a checkmark reaction to the message
-		await e.Message.CreateReactionAsync(DiscordEmoji.FromName(client, ":white_check_mark:"));
+		Console.WriteLine($"Received bot response for ServerVidUpgrader from {e.Author.Username}. Step: {_currentStep}");
+		await e.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":white_check_mark:"));
 
-		// If there's no embeds, wait for 1 second and recount the embeds up to a max of 10 times
 		for (int i = 0; i < 10 && e.Message.Embeds.Count == 0; i++)
 			await Task.Delay(1000);
 
-		StringBuilder response = new();
-
-		response.Append($"Message from {e.Author.Username}#{e.Author.Discriminator} in {e.Channel.Name}:\n");
-		response.Append($"This message has {e.Message.Embeds.Count} embeds.\n");
-
-		//if (e.Message.Embeds[0].Fields[0].Name == "Error")
-		if (e.Message.Embeds.Count == 0 || (e.Message.Embeds[0].Fields?.Count == 1 && e.Message.Embeds[0].Fields[0].Name == "Error"))
+		if (e.Message.Embeds.Count == 0 || IsErrorEmbed(e.Message))
 		{
-			// Increase the fail counter
-			failCounter++;
-
-			// If the fail counter is over 10, pop the map ID
-			if (failCounter >= 1)
-			{
-				mapIds.Dequeue();
-				failCounter = 0;
-
-				// If the queue is empty, return
-				if (mapIds.Count == 0)
-				{
-					Console.WriteLine("We done here!");
-					return;
-				}
-			}
-
-			// Copy the command to the clipboard
-			state = State.Preview;
-			SetClipboard();
-
-			// Press ctrl+v to paste the command
-			SendKeys.SendWait("^v");
-
-			// Wait for .5 seconds
-			await Task.Delay(100);
-
-			// Press enter to send the command
-			SendKeys.SendWait("{ENTER}");
-
+			Console.WriteLine(e.Message.Embeds.Count == 0 ? "No embeds in response." : "Error embed received.");
+			// Use base class's command failure logic. It will retry command or skip item.
+			await base.HandleCommandFailureAsync(e.Message.Embeds.Count == 0 ? "No embeds" : "Error embed");
 			return;
 		}
 
-		// If the message does not have 3 embeds, send the reply and return
-		if ((e.Message.Embeds.Count != 1 && state == State.Main) || (e.Message.Embeds.Count != 3 && state == State.Preview))
+		if (ItemQueue.Count == 0)
 		{
-			await e.Message.RespondAsync(response.ToString());
+			Console.WriteLine("Queue empty, ignoring bot message.");
 			return;
 		}
 
-		if (state == State.Main)
+		JDNextDatabaseEntry currentItem = ItemQueue.Peek();
+
+		if (_currentStep == ServerUpgradeStep.RequestPreview)
 		{
-			// If there's no embeds, wait for 1 second and recount the embeds up to a max of 10 times
-			for (int i = 0; i < 100 && e.Message.Embeds[0].Fields == null; i++)
-				await Task.Delay(100);
-
-			if (e.Message.Embeds[0].Fields == null)
-			{
-				SetClipboard();
-
-				// Press ctrl+v to paste the command
-				SendKeys.SendWait("^v");
-
-				// Wait for .5 seconds
-				await Task.Delay(100);
-
-				// Press enter to send the command
-				SendKeys.SendWait("{ENTER}");
-
+			if (e.Message.Embeds.Count < 3)
+			{ // Expect 3 embeds from /assets jdu
+				Console.WriteLine($"Expected 3 embeds for preview, got {e.Message.Embeds.Count}.");
+				await base.HandleCommandFailureAsync("Incorrect embed count for preview");
 				return;
 			}
+			// Parse preview URLs from Embeds[1] (0: images, 1: previews, 2: content links)
+			EmbedParserHelper.ParseFields(_accumulatedSongData.PreviewURLs, e.Message.Embeds[1].Fields, PreviewUrlFieldMap);
 
-			// The first embed contains the song info
-			foreach (DiscordEmbedField field in e.Message.Embeds[0].Fields)
+			_currentStep = ServerUpgradeStep.RequestMain;
+			await SendNextDiscordCommandAsync(); // Sends /nohud command for the same item
+		}
+		else // ServerUpgradeStep.RequestMain
+		{
+			if (e.Message.Embeds.Count < 1)
+			{ // Expect 1 embed from /nohud
+				Console.WriteLine($"Expected 1 embed for main, got {e.Message.Embeds.Count}.");
+				await base.HandleCommandFailureAsync("Incorrect embed count for main");
+				return;
+			}
+			// Parse main content URLs (HD versions)
+			EmbedParserHelper.ParseFields(_accumulatedSongData.ContentURLs, e.Message.Embeds[0].Fields, MainContentUrlFieldMap);
+
+			Console.WriteLine($"Successfully parsed all data for item: {currentItem.parentMapName}. Processing...");
+			bool success = await ProcessDataItemAsync(_accumulatedSongData, currentItem);
+
+			_currentStep = ServerUpgradeStep.RequestPreview; // Reset state for the next item
+			_accumulatedSongData = new JDNextDiscordEmbed(); // Clear accumulated data
+
+			if (success)
 			{
-				string name = field.Name;
-				string? value = Program.CleanURL(field.Value);
-				if (name == "Ultra HD:")
-					currentSongData.ContentURLs.UltraHD = value;
-				else if (name == "High HD:")
-					currentSongData.ContentURLs.HighHD = value;
-				else if (name == "Mid HD:")
-					currentSongData.ContentURLs.MidHD = value;
-				else if (name == "Low HD:")
-					currentSongData.ContentURLs.LowHD = value;
+				Console.WriteLine($"Successfully processed item: {currentItem.parentMapName}.");
+				FailCounterForCurrentItem = 0;
+				ItemQueue.Dequeue();
+				await SendNextDiscordCommandAsync(); // Move to next item
+			}
+			else
+			{
+				// Use base class's item processing failure logic
+				await base.HandleItemProcessingFailureAsync(currentItem, "ProcessDataItemAsync returned false.");
 			}
 		}
-		else 
-		{
-			// The second embed contains the preview URLs
-			foreach (DiscordEmbedField field in e.Message.Embeds[1].Fields)
-			{
-				string name = field.Name;
-				string? value = Program.CleanURL(field.Value);
-
-				if (name == "Audio:")
-					currentSongData.PreviewURLs.audioPreview = value;
-				else if (name == "HIGH (vp9)")
-					currentSongData.PreviewURLs.HIGHvp9 = value;
-				else if (name == "LOW (vp9)")
-					currentSongData.PreviewURLs.LOWvp9 = value;
-				else if (name == "MID (vp9)")
-					currentSongData.PreviewURLs.MIDvp9 = value;
-				else if (name == "ULTRA (vp9)")
-					currentSongData.PreviewURLs.ULTRAvp9 = value;
-			}
-
-			state = State.Main;
-			SetClipboard();
-
-			// Press ctrl+v to paste the command
-			SendKeys.SendWait("^v");
-
-			// Wait for .5 seconds
-			await Task.Delay(100);
-
-			// Press enter to send the command
-			SendKeys.SendWait("{ENTER}");
-
-			return;
-		}
-
-		// Download the map
-		bool failed = !await DownloadMap(currentSongData, mapIds.Peek());
-		if (failed)
-			// If the download failed, increment the fail counter
-			failCounter++;
-
-		// Pop the map ID if we didn't fail or the fail counter is over 10
-		if (!failed || failCounter >= 1)
-		{
-			mapIds.Dequeue();
-			failCounter = 0;
-		}
-
-		// If the queue is empty, return
-		if (mapIds.Count == 0 && state == State.Main)
-		{
-			Console.WriteLine("We done here!");
-			return;
-		}
-
-		// Copy the command to the clipboard
-		state = State.Preview;
-		SetClipboard();
-
-		// Press ctrl+v to paste the command
-		SendKeys.SendWait("^v");
-
-		// Wait for .5 seconds
-		await Task.Delay(100);
-
-		// Press enter to send the command
-		SendKeys.SendWait("{ENTER}");
 	}
 
-	static async Task<bool> DownloadMap(JDNextDiscordEmbed songURLs, JDNextDatabaseEntry songInfo)
+	// We've overridden OnDiscordMessageCreatedAsync, so ParseEmbedsToData is not directly called by base.
+	// Logic is in the overridden OnDiscordMessageCreatedAsync.
+	protected override JDNextDiscordEmbed? ParseEmbedsToData(DiscordMessage message)
+	{
+		// This won't be called by the base flow due to the override.
+		// If it were, it would need to be state-aware (_currentStep).
+		return null;
+	}
+
+	protected override async Task<bool> ProcessDataItemAsync(JDNextDiscordEmbed songURLs, JDNextDatabaseEntry songInfo)
 	{
 		string mapName = songInfo.parentMapName;
+		Console.WriteLine($"Upgrading videos for '{mapName}'...");
 
-		// If any of the URLs are null, return false (except for songTitleLogo ofc because it's optional)
-		if (songURLs.PreviewURLs.audioPreview is null ||
-			songURLs.ContentURLs.UltraHD is null ||
-			songURLs.ContentURLs.HighHD is null ||
-			songURLs.ContentURLs.MidHD is null ||
-			songURLs.ContentURLs.LowHD is null ||
-			songURLs.PreviewURLs.HIGHvp9 is null ||
-			songURLs.PreviewURLs.LOWvp9 is null ||
-			songURLs.PreviewURLs.MIDvp9 is null ||
-			songURLs.PreviewURLs.ULTRAvp9 is null)
+		// Validate essential URLs from accumulated data
+		if (songURLs.PreviewURLs.audioPreview == null || // from /assets jdu
+			songURLs.PreviewURLs.ULTRAvp9 == null || songURLs.PreviewURLs.HIGHvp9 == null ||
+			songURLs.PreviewURLs.MIDvp9 == null || songURLs.PreviewURLs.LOWvp9 == null ||
+			songURLs.ContentURLs.UltraHD == null || songURLs.ContentURLs.HighHD == null || // from /nohud
+			songURLs.ContentURLs.MidHD == null || songURLs.ContentURLs.LowHD == null)
 		{
-			Console.WriteLine($"Missing URLs for {mapName}");
+			Console.WriteLine($"Essential URLs missing for '{mapName}' after two-step fetch. Cannot upgrade.");
 			return false;
 		}
 
-		Console.WriteLine($"Downloading the map {mapName}");
+		string mapPath = Path.Combine(OutputDirectory, mapName);
+		string videoPath = Path.Combine(mapPath, "video");
+		string videoPreviewPath = Path.Combine(mapPath, "videoPreview");
+		string audioPreviewOpusPath = Path.Combine(mapPath, "AudioPreview_opus");
 
-		// Output path
-		string path = Path.Combine(input, mapName);
+		Directory.CreateDirectory(videoPath);
+		Directory.CreateDirectory(videoPreviewPath);
+		Directory.CreateDirectory(audioPreviewOpusPath);
 
-		// Delete the UNKNOWN.webm video files
-		if (File.Exists(Path.Combine(path, "video", "UNKNOWN.webm")))
+		// Clean up old "UNKNOWN.webm" files if they exist (as per original logic)
+		string unknownVideo = Path.Combine(videoPath, "UNKNOWN.webm");
+		string unknownPreview = Path.Combine(videoPreviewPath, "UNKNOWN.webm");
+		string lowPreviewLegacy = Path.Combine(videoPreviewPath, "LOW.webm"); // Also in original logic
+		if (File.Exists(unknownVideo))
+			File.Delete(unknownVideo);
+		if (File.Exists(unknownPreview))
+			File.Delete(unknownPreview);
+		if (File.Exists(lowPreviewLegacy))
+			File.Delete(lowPreviewLegacy);
+
+		List<Task> downloadTasks =
+		[
+			// Preview videos (vp9 versions)
+			Download.DownloadFileMD5Async(songURLs.PreviewURLs.LOWvp9, videoPreviewPath),
+			Download.DownloadFileMD5Async(songURLs.PreviewURLs.MIDvp9, videoPreviewPath),
+			Download.DownloadFileMD5Async(songURLs.PreviewURLs.HIGHvp9, videoPreviewPath),
+			Download.DownloadFileMD5Async(songURLs.PreviewURLs.ULTRAvp9, videoPreviewPath),
+
+			// Main videos (HD versions)
+			Download.DownloadFileMD5Async(songURLs.ContentURLs.UltraHD, videoPath),
+			Download.DownloadFileMD5Async(songURLs.ContentURLs.HighHD, videoPath),
+			Download.DownloadFileMD5Async(songURLs.ContentURLs.MidHD, videoPath),
+			Download.DownloadFileMD5Async(songURLs.ContentURLs.LowHD, videoPath),
+		];
+
+		// Audio preview (opus)
+		// Check if AudioPreview_opus folder is empty or doesn't exist (original logic)
+		if (!Directory.Exists(audioPreviewOpusPath) || Directory.GetFiles(audioPreviewOpusPath).Length == 0)
 		{
-			File.Delete(Path.Combine(path, "video", "UNKNOWN.webm"));
-			File.Delete(Path.Combine(path, "videoPreview", "UNKNOWN.webm"));
-			File.Delete(Path.Combine(path, "videoPreview", "LOW.webm"));
+			downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.PreviewURLs.audioPreview, audioPreviewOpusPath));
 		}
 
-		List<Task<string>> tasks = [];
-
-		// TODO: somehow check if the file already exists and skip the download if it does
-		// Gotta figure out how to get the hash before downloading the file
-		tasks.Add(Download.DownloadFileMD5Async(songURLs.PreviewURLs.LOWvp9, Path.Combine(path, "videoPreview")));
-		tasks.Add(Download.DownloadFileMD5Async(songURLs.PreviewURLs.MIDvp9, Path.Combine(path, "videoPreview")));
-		tasks.Add(Download.DownloadFileMD5Async(songURLs.PreviewURLs.HIGHvp9, Path.Combine(path, "videoPreview")));
-		tasks.Add(Download.DownloadFileMD5Async(songURLs.PreviewURLs.ULTRAvp9, Path.Combine(path, "videoPreview")));
-		if (!Directory.Exists(Path.Combine(path, "AudioPreview_opus")) || Directory.GetFiles(Path.Combine(path, "AudioPreview_opus")).Length == 0)
-			tasks.Add(Download.DownloadFileMD5Async(songURLs.PreviewURLs.audioPreview, Path.Combine(path, "AudioPreview_opus")));
-
-		tasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.UltraHD, Path.Combine(path, "video")));
-		tasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.HighHD, Path.Combine(path, "video")));
-		tasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.MidHD, Path.Combine(path, "video")));
-		tasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.LowHD, Path.Combine(path, "video")));
-
-		// Wait for all downloads to complete
-		await Task.WhenAll(tasks);
-
-		// Return true
-		return true;
+		try
+		{
+			await Task.WhenAll(downloadTasks);
+			Console.WriteLine($"Successfully upgraded videos for '{mapName}'.");
+			return true;
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"One or more downloads failed during video upgrade for '{mapName}': {ex.Message}");
+			return false;
+		}
 	}
 }

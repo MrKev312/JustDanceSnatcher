@@ -1,282 +1,351 @@
 ﻿using JustDanceSnatcher.Helpers;
-using JustDanceSnatcher.UbisoftStuff;
+using JustDanceSnatcher.UbisoftStuff; // For UbiArtSong, ContentAuthorization, SkuPackage
 
 using System.Diagnostics;
 using System.IO.Compression;
+using System.Text;
 using System.Text.Json;
 
 namespace JustDanceSnatcher;
 
-class Temp
+internal static class Temp
 {
 	public static void CreateContentAuthorization()
 	{
-		// Ask for ubiart json database
 		string ubiartJsonPath = Question.AskFile("Enter the path to the UbiArt JSON database: ", true);
-		// Ask for server song path
-		string output = Question.AskFolder("Enter the path to your maps folder: ", true);
+		string mapsFolder = Question.AskFolder("Enter the path to your maps folder (to check existing): ", true);
+		string outputJsonFile = "contentAuthorization.json"; // Define output filename
 
-		// Parse the ubiart json database
-		Dictionary<string, UbiArtSong> ubiArtDB = JsonSerializer.Deserialize<Dictionary<string, UbiArtSong>>(File.ReadAllText(ubiartJsonPath))!;
+		Dictionary<string, UbiArtSong> ubiArtDB = JsonSerializer.Deserialize<Dictionary<string, UbiArtSong>>(File.ReadAllText(ubiartJsonPath), Program.jsonOptions)!;
+		string[] existingMapNames = Directory.Exists(mapsFolder)
+			? [.. Directory.GetDirectories(mapsFolder).Select(s => Path.GetFileName(s)!)]
+			: [];
 
-		// Get all folder names in the output folder
-		string[] folders = Directory.GetDirectories(output).Select(Path.GetFileName).ToArray()!;
+		UbiArtSong[] missingSongs = [.. ubiArtDB.Values
+			.Where(song => !existingMapNames.Contains(song.mapName, StringComparer.OrdinalIgnoreCase))
+			.OrderBy(song => song.title)];
 
-		//string[] missing = ubiArtDB.Keys.Except(folders).ToArray();
-		UbiArtSong[] missing = ubiArtDB.Values.Where(song => !folders.Contains(song.mapName)).ToArray();
+		Console.WriteLine($"Found {missingSongs.Length} missing songs to create content authorization for.");
+		if (missingSongs.Length == 0)
+			return;
 
-		Console.WriteLine($"Missing songs ({missing.Length}):");
-
-		// Sort it by song name
-		UbiArtSong[] sorted = [.. missing.OrderBy(song => song.title)];
-
-		Dictionary<string, ContentAuthorization> songToFolder = [];
-
-		JsonSerializerOptions options = new() { WriteIndented = true };
-
-		if (File.Exists("contentAuthorization.json"))
-			songToFolder = JsonSerializer.Deserialize<Dictionary<string, ContentAuthorization>>(File.ReadAllText("contentAuthorization.json"))!;
-
-		// for each song in the ubiart database
-		foreach (UbiArtSong song in sorted)
+		Dictionary<string, ContentAuthorization> songToAuthMap = [];
+		if (File.Exists(outputJsonFile))
 		{
-			// Print the title (mapName)
-			Console.WriteLine($"{song.title} ({song.mapName}) ({songToFolder.Count}/{missing.Length - 1})");
-
-			// Now keep reading input until a blank line is entered
-			string input = Console.ReadLine()!;
-
-			if (input == "skip")
-				continue;
-
-			while (true)
+			try
 			{
-				string line = Console.ReadLine()!;
+				songToAuthMap = JsonSerializer.Deserialize<Dictionary<string, ContentAuthorization>>(File.ReadAllText(outputJsonFile), Program.jsonOptions) ?? [];
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Warning: Could not load existing '{outputJsonFile}': {ex.Message}. Starting fresh.");
+			}
+		}
 
-				if (string.IsNullOrWhiteSpace(line))
-					break;
-
-				input += line + Environment.NewLine;
+		int processedCount = 0;
+		foreach (UbiArtSong song in missingSongs)
+		{
+			if (songToAuthMap.ContainsKey(song.mapName))
+			{
+				Console.WriteLine($"Skipping {song.title} ({song.mapName}) as it's already in '{outputJsonFile}'.");
+				processedCount++;
+				continue;
 			}
 
-			// Parse the input as a ContentAuthorization object
-			ContentAuthorization contentAuthorization = JsonSerializer.Deserialize<ContentAuthorization>(input)!;
+			Console.WriteLine($"\n({processedCount + 1}/{missingSongs.Length}) For song: {song.title} ({song.mapName})");
+			Console.WriteLine("Paste the ContentAuthorization JSON for this song. Enter a blank line when done, or 'skip' to skip this song.");
 
-			// Add the song to the dictionary
-			songToFolder[song.mapName] = contentAuthorization;
+			StringBuilder jsonInputBuilder = new();
+			string? line;
+			bool firstLine = true;
+			while (!string.IsNullOrWhiteSpace(line = Console.ReadLine()))
+			{
+				if (firstLine && line.Trim().Equals("skip", StringComparison.OrdinalIgnoreCase))
+				{
+					jsonInputBuilder.Clear(); // Ensure it's empty
+					break;
+				}
 
-			// Write just in case
-			File.WriteAllText("contentAuthorization.json", JsonSerializer.Serialize(songToFolder, options));
+				jsonInputBuilder.AppendLine(line);
+				firstLine = false;
+			}
+
+			string jsonInput = jsonInputBuilder.ToString();
+			if (string.IsNullOrWhiteSpace(jsonInput))
+			{
+				Console.WriteLine("Skipped.");
+				continue; // Skip if input was 'skip' or empty
+			}
+
+			try
+			{
+				ContentAuthorization? contentAuth = JsonSerializer.Deserialize<ContentAuthorization>(jsonInput, Program.jsonOptions);
+				if (contentAuth != null)
+				{
+					songToAuthMap[song.mapName] = contentAuth;
+					File.WriteAllText(outputJsonFile, JsonSerializer.Serialize(songToAuthMap, Program.jsonOptions));
+					Console.WriteLine($"Saved authorization for {song.mapName}.");
+					processedCount++;
+				}
+				else
+				{
+					Console.WriteLine("Failed to parse JSON input. Please try again or check format.");
+					// To retry, this loop would need adjustment, or user manually re-runs for this song.
+					// For now, it moves to next song.
+				}
+			}
+			catch (JsonException ex)
+			{
+				Console.WriteLine($"Invalid JSON: {ex.Message}. Authorization for {song.mapName} not saved.");
+			}
 		}
+
+		Console.WriteLine("ContentAuthorization creation process finished.");
 	}
 
-	static readonly HttpClient client = new();
-
-	public static void DownloadFromContentAuthorization()
+	// Made async to use awaitable DownloadFileAsync
+	public static async Task DownloadFromContentAuthorizationAsync()
 	{
-		// Ask for the path to the contentAuthorization.json file
-		string contentAuthorizationPath = Question.AskFile("Enter the path to the contentAuthorization JSON file: ", true);
-		// Ask for database path
+		string contentAuthPath = Question.AskFile("Enter the path to the contentAuthorization JSON file: ", true);
 		string databasePath = Question.AskFile("Enter the path to the UbiArt JSON database: ", true);
-		// Ask for SkuPackage path
 		string skuPackagePath = Question.AskFile("Enter the path to the SkuPackage JSON file: ", true);
+		string outputRootFolder = Question.AskFolder("Enter the path to the output folder for downloads: ", false); // Create if not exists
 
-		// Ask for the output folder
-		string output = Question.AskFolder("Enter the path to the output folder: ", true);
+		Dictionary<string, ContentAuthorization> contentAuthDict = JsonSerializer.Deserialize<Dictionary<string, ContentAuthorization>>(File.ReadAllText(contentAuthPath), Program.jsonOptions)!;
+		Dictionary<string, UbiArtSong> ubiArtDB = JsonSerializer.Deserialize<Dictionary<string, UbiArtSong>>(File.ReadAllText(databasePath), Program.jsonOptions)!;
+		Dictionary<string, SkuPackage> skuPackageDB = JsonSerializer.Deserialize<Dictionary<string, SkuPackage>>(File.ReadAllText(skuPackagePath), Program.jsonOptions)!;
 
-		// Parse the contentAuthorization.json file
-		Dictionary<string, ContentAuthorization> contentAuthorization = JsonSerializer.Deserialize<Dictionary<string, ContentAuthorization>>(File.ReadAllText(contentAuthorizationPath))!;
+		string tempZipFolder = Path.Combine(outputRootFolder, "temp_zips");
+		Directory.CreateDirectory(tempZipFolder);
 
-		// Parse the ubiart json database
-		Dictionary<string, UbiArtSong> ubiArtDB = JsonSerializer.Deserialize<Dictionary<string, UbiArtSong>>(File.ReadAllText(databasePath))!;
-
-		// Parse the SkuPackage json file
-		Dictionary<string, SkuPackage> skuPackage = JsonSerializer.Deserialize<Dictionary<string, SkuPackage>>(File.ReadAllText(skuPackagePath))!;
-
-		// Loop through each song in the contentAuthorization.json file
-		foreach (KeyValuePair<string, ContentAuthorization> pair in contentAuthorization)
+		Console.WriteLine("--- Downloading IPK archives ---");
+		foreach (KeyValuePair<string, ContentAuthorization> pair in contentAuthDict)
 		{
-			if (File.Exists(Path.Combine(output, $"{pair.Key}.ipk")))
+			string mapName = pair.Key;
+			string ipkOutputPath = Path.Combine(outputRootFolder, $"{mapName}.ipk");
+
+			if (File.Exists(ipkOutputPath))
 			{
-				Console.WriteLine($"Skipping {pair.Key}");
+				Console.WriteLine($"IPK for '{mapName}' already exists. Skipping download.");
 				continue;
 			}
 
-			// Get the song and the SkuPackage
-			UbiArtSong song = ubiArtDB[pair.Key];
-			string mapContent = song.packages.mapContent;
-			SkuPackage package = skuPackage[mapContent];
-			string url = package.url;
+			if (!ubiArtDB.TryGetValue(mapName, out UbiArtSong? song) || song == null)
+			{
+				Console.WriteLine($"Warning: Song '{mapName}' not found in UbiArt DB. Skipping.");
+				continue;
+			}
 
-			// Download it in output/temp/{key}.zip
-			string temp = Path.Combine(output, "temp", $"{pair.Key}.zip");
-			Directory.CreateDirectory(Path.GetDirectoryName(temp)!);
-			DownloadFile(url, temp);
+			if (string.IsNullOrEmpty(song.packages?.mapContent) || !skuPackageDB.TryGetValue(song.packages.mapContent, out SkuPackage? package) || package == null)
+			{
+				Console.WriteLine($"Warning: SkuPackage info missing for '{mapName}'. Cannot download IPK. MapContent: {song.packages?.mapContent}");
+				continue;
+			}
 
-			// Extract the file ending in .ipk to output/{key}.ipk
-			string ipk = Path.Combine(output, $"{pair.Key}.ipk");
-			ExtractIpkFile(temp, ipk);
+			string zipUrl = package.url;
+			string tempZipPath = Path.Combine(tempZipFolder, $"{mapName}.zip");
+
+			try
+			{
+				Console.WriteLine($"Downloading ZIP for '{mapName}' from '{zipUrl}'...");
+				await Download.DownloadFileAsync(zipUrl, tempZipFolder, $"{mapName}.zip"); // Downloads to temp_zips/MapName.zip
+				ExtractIpkFile(tempZipPath, ipkOutputPath);
+				File.Delete(tempZipPath); // Clean up zip after extraction
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error processing IPK for '{mapName}': {ex.Message}");
+			}
 		}
 
-		// Delete the temp folder
-		if (Directory.Exists(Path.Combine(output, "temp")))
-			Directory.Delete(Path.Combine(output, "temp"), recursive: true);
+		if (Directory.Exists(tempZipFolder) && !Directory.EnumerateFileSystemEntries(tempZipFolder).Any())
+		{
+			Directory.Delete(tempZipFolder); // Clean up temp_zips folder if empty
+		}
+		else if (Directory.Exists(tempZipFolder))
+		{
+			Console.WriteLine($"Temporary zip files may remain in '{tempZipFolder}'.");
+		}
 
-		Console.WriteLine("Now simply extract all ipks and press any key to continue");
+
+		Console.WriteLine("\nIPK archives downloaded. Please extract all IPKs into their respective folders (e.g., outputFolder/MapName/...).");
+		Console.WriteLine("Press any key to continue to download associated assets (textures, media)...");
 		Console.ReadKey();
 
-		// Download the needed files for conversion
-		//foreach (KeyValuePair<string, ContentAuthorization> pair in contentAuthorization)
+		Console.WriteLine("\n--- Downloading associated assets ---");
+		List<Task> assetDownloadTasks = [];
 		ParallelOptions parallelOptions = new() { MaxDegreeOfParallelism = 8 };
-		Parallel.ForEach(contentAuthorization, parallelOptions, pair =>
+
+		// Changed to regular foreach with Task list for better error propagation with await Task.WhenAll
+		foreach (var pair in contentAuthDict)
 		{
-			// Get the song and the authorization
-			UbiArtSong song = ubiArtDB[pair.Key];
-			ContentAuthorization authorization = pair.Value;
+			assetDownloadTasks.Add(Task.Run(async () => // Wrap in Task.Run for parallelism with async calls
+			{
+				string mapName = pair.Key;
+				ContentAuthorization auth = pair.Value;
 
-			string basePaths = Path.Combine(output, pair.Key, "world", "maps", pair.Key, "menuart", "textures");
-			Directory.CreateDirectory(basePaths);
-			DownloadFile(song.assets.map_bkgImageUrl, Path.Combine(basePaths, $"{pair.Key}_map_bkg.tga.ckd"));
-			DownloadFile(song.assets.coach1ImageUrl, Path.Combine(basePaths, $"{pair.Key}_coach1.tga.ckd"));
-			if (song.assets.coach2ImageUrl != null)
-				DownloadFile(song.assets.coach2ImageUrl, Path.Combine(basePaths, $"{pair.Key}_coach2.tga.ckd"));
-			if (song.assets.coach3ImageUrl != null)
-				DownloadFile(song.assets.coach3ImageUrl, Path.Combine(basePaths, $"{pair.Key}_coach3.tga.ckd"));
-			if (song.assets.coach4ImageUrl != null)
-				DownloadFile(song.assets.coach4ImageUrl, Path.Combine(basePaths, $"{pair.Key}_coach4.tga.ckd"));
-			DownloadFile(song.assets.expandCoachImageUrl, Path.Combine(basePaths, $"{pair.Key}_AlbumCoach.tga.ckd"));
+				if (!ubiArtDB.TryGetValue(mapName, out UbiArtSong? song) || song == null)
+					return; // Already warned above
 
-			// Download the content authorization files
-			basePaths = Path.Combine(output, pair.Key, "world", "maps", pair.Key, "media");
-			// Get the first one ending in .ogg's URL
-			string oggUrl = authorization.urls.First(pair => pair.Key.EndsWith(".ogg")).Value;
-			DownloadFile(oggUrl, Path.Combine(basePaths, $"{pair.Key}.ogg"));
-			// Get the first one ending in ULTRA.hd.webm's URL
-			string webmUrl = authorization.urls.First(pair => pair.Key.EndsWith("ULTRA.hd.webm")).Value;
-			DownloadFile(webmUrl, Path.Combine(basePaths, $"{pair.Key}_ULTRA.hd.webm"));
+				string mapOutputBase = Path.Combine(outputRootFolder, mapName); // Assets go into outputFolder/MapName/
+				string menuArtTexturesPath = Path.Combine(mapOutputBase, "world", "maps", mapName, "menuart", "textures");
+				string mediaPath = Path.Combine(mapOutputBase, "world", "maps", mapName, "media");
 
-			Console.WriteLine($"Downloaded {pair.Key}");
-		});
+				Directory.CreateDirectory(menuArtTexturesPath);
+				Directory.CreateDirectory(mediaPath);
+
+				List<Task> currentMapTasks = [];
+
+				// Texture assets
+				if (song.assets != null)
+				{
+					currentMapTasks.Add(TryDownloadAsync(song.assets.map_bkgImageUrl, menuArtTexturesPath, $"{mapName}_map_bkg.tga.ckd"));
+					currentMapTasks.Add(TryDownloadAsync(song.assets.coach1ImageUrl, menuArtTexturesPath, $"{mapName}_coach1.tga.ckd"));
+					if (!string.IsNullOrEmpty(song.assets.coach2ImageUrl))
+						currentMapTasks.Add(TryDownloadAsync(song.assets.coach2ImageUrl, menuArtTexturesPath, $"{mapName}_coach2.tga.ckd"));
+					if (!string.IsNullOrEmpty(song.assets.coach3ImageUrl))
+						currentMapTasks.Add(TryDownloadAsync(song.assets.coach3ImageUrl, menuArtTexturesPath, $"{mapName}_coach3.tga.ckd"));
+					if (!string.IsNullOrEmpty(song.assets.coach4ImageUrl))
+						currentMapTasks.Add(TryDownloadAsync(song.assets.coach4ImageUrl, menuArtTexturesPath, $"{mapName}_coach4.tga.ckd"));
+					currentMapTasks.Add(TryDownloadAsync(song.assets.expandCoachImageUrl, menuArtTexturesPath, $"{mapName}_AlbumCoach.tga.ckd"));
+				}
+
+				// Media assets from content authorization
+				string? oggUrl = auth.urls.FirstOrDefault(u => u.Key.EndsWith(".ogg", StringComparison.OrdinalIgnoreCase)).Value;
+				if (oggUrl != null)
+					currentMapTasks.Add(TryDownloadAsync(oggUrl, mediaPath, $"{mapName}.ogg"));
+				else
+					Console.WriteLine($"Warning: OGG audio URL not found for '{mapName}'.");
+
+				string? webmUrl = auth.urls.FirstOrDefault(u => u.Key.EndsWith("ULTRA.hd.webm", StringComparison.OrdinalIgnoreCase)).Value;
+				if (webmUrl != null)
+					currentMapTasks.Add(TryDownloadAsync(webmUrl, mediaPath, $"{mapName}_ULTRA.hd.webm"));
+				else
+					Console.WriteLine($"Warning: ULTRA.hd.webm URL not found for '{mapName}'.");
+
+				await Task.WhenAll(currentMapTasks);
+				Console.WriteLine($"Finished asset downloads for '{mapName}'.");
+			}));
+		}
+
+		await Task.WhenAll(assetDownloadTasks);
+		Console.WriteLine("All asset downloads attempted.");
 	}
 
-	static void DownloadFile(string url, string output)
+	private static async Task TryDownloadAsync(string? url, string folder, string filename)
 	{
-		// Create the directory if it doesn't exist
-		Directory.CreateDirectory(Path.GetDirectoryName(output)!);
-
-		// If the file exists, skip it
-		if (File.Exists(output))
+		if (string.IsNullOrEmpty(url))
 			return;
-
-		// Download the file
-		using Stream stream = client.GetStreamAsync(url).Result;
-		using FileStream file = File.Create(output);
-		stream.CopyTo(file);
+		try
+		{
+			await Download.DownloadFileAsync(url, folder, filename);
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"Failed to download '{filename}' from '{url}': {ex.Message}");
+		}
 	}
 
-	// Function to extract the .ipk file from the .zip
-	static void ExtractIpkFile(string zipFilePath, string ipkDestination)
+	private static void ExtractIpkFile(string zipFilePath, string ipkDestinationPath)
 	{
-		// Open the zip file
 		using ZipArchive archive = ZipFile.OpenRead(zipFilePath);
+		ZipArchiveEntry? ipkEntry = archive.Entries.FirstOrDefault(entry => entry.FullName.EndsWith(".ipk", StringComparison.OrdinalIgnoreCase))
+			?? throw new FileNotFoundException($"No .ipk file found in ZIP archive '{zipFilePath}'.");
+		Console.WriteLine($"Extracting '{ipkEntry.FullName}' to '{ipkDestinationPath}'...");
+		ipkEntry.ExtractToFile(ipkDestinationPath, overwrite: true);
+		Console.WriteLine($"Extracted successfully.");
+	}
 
-		// Find the .ipk file in the zip archive
-		foreach (ZipArchiveEntry entry in archive.Entries)
+	public static void FixAudio()
+	{
+		string inputMapsFolder = Question.AskFolder("Enter the path to the input maps folder (for audio fixing): ", true);
+		string[] mapFolderPaths = Directory.GetDirectories(inputMapsFolder);
+
+		List<(string audioFilePath, float targetGainDb)> filesToFix = [];
+
+		Parallel.ForEach(mapFolderPaths, mapFolderPath =>
 		{
-			if (!entry.FullName.EndsWith(".ipk", StringComparison.OrdinalIgnoreCase))
-				continue;
+			string mapName = Path.GetFileName(mapFolderPath);
+			string songInfoPath = Path.Combine(mapFolderPath, "SongInfo.json");
+			if (!File.Exists(songInfoPath))
+				return;
 
-			// Extract the .ipk file to the destination
-			entry.ExtractToFile(ipkDestination, overwrite: true);
-			Console.WriteLine($"Extracted {entry.FullName} to {ipkDestination}");
+			JDNextDatabaseEntry? song = JsonSerializer.Deserialize<JDNextDatabaseEntry>(File.ReadAllText(songInfoPath), Program.jsonOptions);
+			if (song == null || !song.tags.Contains("Custom", StringComparer.OrdinalIgnoreCase))
+				return;
+
+			ProcessAudioFileForFixing(Path.Combine(mapFolderPath, "Audio_opus"), mapName, -12.2f, filesToFix);
+			ProcessAudioFileForFixing(Path.Combine(mapFolderPath, "AudioPreview_opus"), mapName + " (Preview)", -11.1f, filesToFix);
+		});
+
+		filesToFix.Sort((a, b) => string.Compare(a.audioFilePath, b.audioFilePath, StringComparison.OrdinalIgnoreCase));
+
+		if (filesToFix.Count > 0)
+		{
+			Console.WriteLine($"\nFound {filesToFix.Count} audio files needing volume adjustment:");
+			foreach (var (filePath, gain) in filesToFix)
+			{
+				Console.WriteLine($"- '{Path.GetFileName(Path.GetDirectoryName(filePath))}/{Path.GetFileName(filePath)}' needs {gain:F1} dB gain.");
+			}
+
+			Console.Write("Proceed with fixing? (y/n): ");
+			if (Console.ReadLine()?.Trim().ToLowerInvariant() != "y")
+			{
+				Console.WriteLine("Audio fixing aborted by user.");
+				return;
+			}
+
+			foreach (var (filePath, gain) in filesToFix)
+			{
+				Console.WriteLine($"Fixing '{filePath}' by {gain:F1} dB...");
+				IncreaseVolume(filePath, gain);
+			}
+
+			Console.WriteLine("Audio fixing process completed.");
+		}
+		else
+		{
+			Console.WriteLine("No audio files found requiring volume adjustment based on current criteria.");
+		}
+	}
+
+	private static void ProcessAudioFileForFixing(string audioFolder, string logName, float targetIntegratedLoudness, List<(string, float)> filesToFix)
+	{
+		if (!Directory.Exists(audioFolder))
+			return;
+		string? audioFile = Directory.GetFiles(audioFolder).FirstOrDefault();
+		if (audioFile == null)
+			return;
+
+		float? currentLoudness = GetIntegratedLoudness(audioFile);
+		if (currentLoudness == null)
+		{
+			Console.WriteLine($"Could not determine loudness for '{logName}'. Skipping.");
 			return;
 		}
 
-		throw new Exception("No .ipk file found in the zip archive");
-	}
-
-	internal static void FixAudio()
-	{
-		// Ask for an input maps folder
-		string input = Question.AskFolder("Enter the path to the input maps folder: ", true);
-
-		// Get all folder names in the input folder
-		string[] folders = Directory.GetDirectories(input).Select(Path.GetFileName).ToArray()!;
-
-		List<(string name, float volume)> toFix = [];
-
-		// for each folder in the input folder
-		//foreach (string folder in folders)
-		Parallel.ForEach(folders, folder =>
+		// Original criteria: if loudness < -16 LUFS
+		if (currentLoudness.Value < -16.0f)
 		{
-			// Check the SongInfo.json file
-			string songInfo = Path.Combine(input, folder, "SongInfo.json");
-			if (!File.Exists(songInfo))
-				return;
+			float gainNeeded = targetIntegratedLoudness - currentLoudness.Value;
+			// Round to one decimal place
+			gainNeeded = (float)Math.Round(gainNeeded, 1);
 
-			// Parse the SongInfo.json file
-			JDNextDatabaseEntry song = JsonSerializer.Deserialize<JDNextDatabaseEntry>(File.ReadAllText(songInfo))!;
-
-			// If it doesn't have a "Custom" tag, skip it
-			if (!song.tags.Contains("Custom"))
-				return;
-
-			// Get the Audio_opus subfolder and grab the only file in it
-			string audioOpus = Path.Combine(input, folder, "Audio_opus");
-			string audioFile = Directory.GetFiles(audioOpus).First();
-			float? loudness = GetLoudness(audioFile);
-
-			if (loudness == null)
+			if (Math.Abs(gainNeeded) > 0.05) // Only add if meaningful gain is needed
 			{
-				Console.WriteLine($"Couldn't extract loudness for {folder}");
-				return;
+				Console.WriteLine($"'{logName}' current loudness: {currentLoudness.Value:F1} LUFS. Target: {targetIntegratedLoudness} LUFS. Calculated gain: {gainNeeded:F1} dB.");
+				lock (filesToFix)
+				{
+					filesToFix.Add((audioFile, gainNeeded));
+				}
 			}
-
-			if (loudness.Value < -16f)
-			{
-				float diff = -12.2f - loudness.Value;
-				// Truncate the decimal part to one digit
-				diff = (float)Math.Truncate(diff * 10) / 10;
-				Console.WriteLine($"{folder} is too quiet by {diff}");
-				toFix.Add((audioFile, diff));
-			}
-
-			// Do the same but for the audio preview
-			string audioPreview = Path.Combine(input, folder, "AudioPreview_opus");
-			string audioPreviewFile = Directory.GetFiles(audioPreview).First();
-			float? loudnessPreview = GetLoudness(audioPreviewFile);
-
-			if (loudnessPreview == null)
-			{
-				Console.WriteLine($"Couldn't extract loudness for {folder}");
-				return;
-			}
-
-			if (loudnessPreview.Value < -16f)
-			{
-				float diff = -11.1f - loudnessPreview.Value;
-				// Truncate the decimal part to one digit
-				diff = (float)Math.Truncate(diff * 10) / 10;
-				Console.WriteLine($"{folder} is too quiet by {diff}");
-				toFix.Add((audioPreviewFile, diff));
-			}
-		});
-
-		// Sort the list by name
-		toFix.Sort((a, b) => string.Compare(a.name, b.name));
-
-		foreach ((string name, float volume) in toFix)
-		{
-			Console.WriteLine($"Fixing {name} by {volume}");
-			IncreaseVolume(name, volume);
 		}
 	}
 
-	private static float? GetLoudness(string audioFile)
+	private static float? GetIntegratedLoudness(string audioFilePath)
 	{
-		string arguments = $"-i \"{audioFile}\" -af ebur128 -f null -";
-
-		// Configure ProcessStartInfo
+		// EBU R128 integrated loudness (I value)
+		string arguments = $"-nostats -i \"{audioFilePath}\" -af ebur128=framelog=verbose -f null -";
 		ProcessStartInfo startInfo = new()
 		{
 			FileName = "ffmpeg",
@@ -287,43 +356,45 @@ class Temp
 			CreateNoWindow = true
 		};
 
-		Process process = Process.Start(startInfo)!;
+		try
+		{
+			using Process process = Process.Start(startInfo)!;
+			string ffmpegOutput = process.StandardError.ReadToEnd(); // EBU R128 summary is on stderr
+			process.WaitForExit();
 
-		string output = process.StandardError.ReadToEnd();
-		process.WaitForExit();
-		process.Close();
-		process.Dispose();
+			// Example relevant line: Integrated loudness: I: -23.0 LUFS
+			string[] lines = ffmpegOutput.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+			string? loudnessLine = lines.LastOrDefault(line => line.Contains("Integrated loudness:") && line.Contains("LUFS"));
 
-		float? loudness = ExtractLoudness(output);
-		return loudness;
-	}
+			if (loudnessLine != null)
+			{
+				int iMarker = loudnessLine.IndexOf("I:") + 2; // Start after "I: "
+				int lufsMarker = loudnessLine.IndexOf("LUFS", iMarker);
+				if (iMarker > 1 && lufsMarker > iMarker)
+				{
+					string loudnessValueStr = loudnessLine.Substring(iMarker, lufsMarker - iMarker).Trim();
+					if (float.TryParse(loudnessValueStr, System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out float loudnessValue))
+					{
+						return loudnessValue;
+					}
+				}
+			}
 
-	static float? ExtractLoudness(string output)
-	{
-		// Find the line with the loudness
-		IEnumerable<string> lines = output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-			.TakeLast(8);
-
-		string? line = lines.FirstOrDefault(line => line.Contains("I:"));
-
-		// If the line is null, return null
-		if (line == null)
+			Console.WriteLine($"Could not parse integrated loudness from FFmpeg output for '{Path.GetFileName(audioFilePath)}'.");
+			// Console.WriteLine($"FFMPEG Output: {ffmpegOutput}"); // For debugging
 			return null;
-
-		// Split the line by spaces
-		string[] parts = line.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
-		// Find the part with the loudness
-		string loudness = parts[1];
-
-		// Parse the loudness as a float
-		return float.Parse(loudness);
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"Error running FFmpeg for loudness check on '{Path.GetFileName(audioFilePath)}': {ex.Message}");
+			return null;
+		}
 	}
 
-	static void IncreaseVolume(string input, float volume)
+	private static void IncreaseVolume(string audioFilePath, float gainDb)
 	{
-		// Increase volume by 4 dB using ffmpeg and overwrite the file
-		string arguments = $"-i \"{input}\" -af \"volume={volume}dB\" -c:a libopus -f opus -y \"{input}.mod\"";
+		string tempOutputFile = $"{audioFilePath}.tmp.opus"; // FFmpeg prefers different input/output files
+		string arguments = $"-i \"{audioFilePath}\" -af \"volume={gainDb:F1}dB\" -c:a libopus -y \"{tempOutputFile}\"";
 		ProcessStartInfo startInfo = new()
 		{
 			FileName = "ffmpeg",
@@ -334,27 +405,46 @@ class Temp
 			CreateNoWindow = true
 		};
 
-		Process process = Process.Start(startInfo)!;
-		process.WaitForExit();
-		process.Close();
-		process.Dispose();
-		// Rename the new file to the original file
-		File.Move($"{input}.mod", input, true);
+		try
+		{
+			using Process process = Process.Start(startInfo)!;
+			// string output = process.StandardError.ReadToEnd(); // For debugging if needed
+			process.WaitForExit();
+			if (process.ExitCode != 0)
+			{
+				// Console.WriteLine($"FFmpeg error for '{Path.GetFileName(audioFilePath)}':\n{output}");
+				throw new Exception($"FFmpeg process exited with code {process.ExitCode} for {Path.GetFileName(audioFilePath)}.");
+			}
+
+			File.Delete(audioFilePath);
+			File.Move(tempOutputFile, audioFilePath);
+			Console.WriteLine($"Volume adjusted for '{Path.GetFileName(audioFilePath)}'.");
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"Error increasing volume for '{Path.GetFileName(audioFilePath)}': {ex.Message}");
+			if (File.Exists(tempOutputFile))
+				try
+				{
+					File.Delete(tempOutputFile); 
+				} catch { }
+		}
 	}
 
+	// SkuPackage and ContentAuthorization classes remain unchanged.
 	public class SkuPackage
 	{
-		public string md5 { get; set; }
+		public string md5 { get; set; } = "";
 		public int storageType { get; set; }
-		public string url { get; set; }
+		public string url { get; set; } = "";
 		public int version { get; set; }
 	}
 
 	public class ContentAuthorization
 	{
-		public string __class { get; set; }
+		public string __class { get; set; } = "";
 		public int duration { get; set; }
 		public int changelist { get; set; }
-		public Dictionary<string, string> urls { get; set; }
+		public Dictionary<string, string> urls { get; set; } = [];
 	}
 }
