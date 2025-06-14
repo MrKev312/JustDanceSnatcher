@@ -63,7 +63,7 @@ public static class Download
 				using FileStream fileStream = File.Create(downloadTempPath);
 				await downloadStream.CopyToAsync(fileStream);
 				await fileStream.FlushAsync();
-				// fileStream is disposed here, releasing the file
+				fileStream.Close(); // Ensure the file is closed before moving
 
 				if (filename == null) // MD5 logic
 				{

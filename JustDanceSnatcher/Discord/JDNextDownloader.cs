@@ -163,13 +163,13 @@ internal class JDNextDownloader : DiscordAssetDownloaderBase<KeyValuePair<string
 		if (songInfo.assets.audioPreviewopus != null)
 			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.audioPreviewopus, Path.Combine(mapPath, "AudioPreview_opus")));
 		if (songInfo.assets.videoPreview_ULTRAvp9webm != null)
-			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.videoPreview_ULTRAvp9webm, Path.Combine(mapPath, "videoPreview"), "ULTRA"));
+			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.videoPreview_ULTRAvp9webm, Path.Combine(mapPath, "videoPreview")));
 		if (songInfo.assets.videoPreview_HIGHvp9webm != null)
-			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.videoPreview_HIGHvp9webm, Path.Combine(mapPath, "videoPreview"), "HIGH"));
+			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.videoPreview_HIGHvp9webm, Path.Combine(mapPath, "videoPreview")));
 		if (songInfo.assets.videoPreview_MIDvp9webm != null)
-			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.videoPreview_MIDvp9webm, Path.Combine(mapPath, "videoPreview"), "MID"));
+			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.videoPreview_MIDvp9webm, Path.Combine(mapPath, "videoPreview")));
 		if (songInfo.assets.videoPreview_LOWvp9webm != null)
-			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.videoPreview_LOWvp9webm, Path.Combine(mapPath, "videoPreview"), "LOW"));
+			downloadTasks.Add(Download.DownloadFileMD5Async(songInfo.assets.videoPreview_LOWvp9webm, Path.Combine(mapPath, "videoPreview")));
 
 		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ImageURLs.Cover, Path.Combine(mapPath, "Cover")));
 		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ImageURLs.coachesLarge, Path.Combine(mapPath, "CoachesLarge")));
@@ -181,12 +181,12 @@ internal class JDNextDownloader : DiscordAssetDownloaderBase<KeyValuePair<string
 		}
 
 		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.Audio, Path.Combine(mapPath, "Audio_opus")));
-		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.UltraHD, Path.Combine(mapPath, "video"), "ULTRA"));
-		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.Highvp9, Path.Combine(mapPath, "video"), "HIGH"));
+		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.UltraHD, Path.Combine(mapPath, "video")));
+		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.Highvp9, Path.Combine(mapPath, "video")));
 		if (songURLs.ContentURLs.Midvp9 != null)
-			downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.Midvp9, Path.Combine(mapPath, "video"), "MID"));
+			downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.Midvp9, Path.Combine(mapPath, "video")));
 		if (songURLs.ContentURLs.Lowvp9 != null)
-			downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.Lowvp9, Path.Combine(mapPath, "video"), "LOW"));
+			downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.Lowvp9, Path.Combine(mapPath, "video")));
 		downloadTasks.Add(Download.DownloadFileMD5Async(songURLs.ContentURLs.mapPackage, Path.Combine(mapPath, "MapPackage")));
 
 		try
