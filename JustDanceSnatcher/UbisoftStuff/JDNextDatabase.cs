@@ -15,6 +15,7 @@ public class JDNextDatabaseEntry
 	public object danceVersionLocId { get; set; }
 	public object difficulty { get; set; }
 	public object doubleScoringType { get; set; }
+	public bool hasCameraScoring { get; set; }
 	public bool hasSongTitleInCover { get; set; }
 	public object lyricsColor { get; set; }
 	public object mapLength { get; set; }
