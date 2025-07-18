@@ -5,6 +5,8 @@ VisualStudioVersion = 17.8.34408.163
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "JustDanceSnatcher", "JustDanceSnatcher\JustDanceSnatcher.csproj", "{E4334C91-5666-4176-8830-BAC676F73C45}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "UniqueBundle", "UniqueBundle\UniqueBundle.csproj", "{9840097B-21E0-44B9-9ACD-84D7F7C822EB}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -15,6 +17,10 @@ Global
 		{E4334C91-5666-4176-8830-BAC676F73C45}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{E4334C91-5666-4176-8830-BAC676F73C45}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{E4334C91-5666-4176-8830-BAC676F73C45}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9840097B-21E0-44B9-9ACD-84D7F7C822EB}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9840097B-21E0-44B9-9ACD-84D7F7C822EB}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9840097B-21E0-44B9-9ACD-84D7F7C822EB}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9840097B-21E0-44B9-9ACD-84D7F7C822EB}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
